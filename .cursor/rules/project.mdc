@@ -1,0 +1,43 @@
+---
+description: Core conventions for the Budget Flow API
+alwaysApply: true
+---
+
+# Budget Flow API
+
+Node.js Express API (CommonJS) with PostgreSQL (`pg`), Passport Google OAuth, and JWT auth.
+
+## Structure
+
+- `src/app.js` — app entry, middleware, route mounting
+- `src/db.js` — shared `pg` Pool
+- `src/config/` — Passport and other config
+- `src/routes/` — Express routers (`*.js` or `*.routes.js`)
+
+## Conventions
+
+- Use CommonJS (`require` / `module.exports`), not ESM
+- Mount routes in `app.js` under clear prefixes (`/auth`, `/api/...`)
+- Use parameterized SQL (`$1`, `$2`, ...) — never string-concatenate user input
+- Prefer `async/await` with try/catch; return JSON errors with appropriate status codes
+- Keep secrets in `.env` (`JWT_*`, `DB_*`, `FRONTEND_URL`, `PORT`) — never commit them
+- Match existing style: Express routers, `pool.query` / `db.query`, JWT access + refresh tokens
+
+## Responses
+
+All API responses use a shared shape via `src/utils/response.js`:
+
+```json
+{ "status": 200, "message": "...", "data": ... }
+```
+
+Default status codes:
+- `200` — list, get, update, delete success
+- `201` — create success
+- `400` — validation / bad request
+- `401` — unauthorized
+- `403` — forbidden
+- `404` — not found
+- `409` — conflict (e.g. duplicate)
+- `500` — server error
+

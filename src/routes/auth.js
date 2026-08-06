@@ -2,6 +2,14 @@ const express = require("express");
 const passport = require("passport");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
+const authenticate = require("../middleware/authenticate");
+const {
+  success,
+  unauthorized,
+  forbidden,
+  notFound,
+  serverError,
+} = require("../utils/response");
 
 const router = express.Router();
 
@@ -30,6 +38,16 @@ function generateRefreshToken(user) {
   );
 }
 
+function mapUser(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    photo: row.photo,
+    google_id: row.google_id,
+  };
+}
+
 router.get(
   "/google",
   passport.authenticate("google", {
@@ -43,9 +61,7 @@ router.get(
     session: false,
   }),
   async (req, res) => {
-
     const accessToken = generateAccessToken(req.user);
-
     const refreshToken = generateRefreshToken(req.user);
 
     await pool.query(
@@ -60,17 +76,13 @@ router.get(
 );
 
 router.post("/refresh-token", async (req, res) => {
-
   const { refreshToken } = req.body;
 
   if (!refreshToken) {
-    return res.status(401).json({
-      message: "Refresh token missing",
-    });
+    return unauthorized(res, "Refresh token missing");
   }
 
   try {
-
     const decoded = jwt.verify(
       refreshToken,
       process.env.JWT_REFRESH_SECRET
@@ -82,43 +94,85 @@ router.post("/refresh-token", async (req, res) => {
     );
 
     if (user.rows.length === 0) {
-      return res.status(403).json({
-        message: "User not found",
-      });
+      return forbidden(res, "User not found");
     }
 
     if (user.rows[0].refresh_token !== refreshToken) {
-      return res.status(403).json({
-        message: "Invalid refresh token",
-      });
+      return forbidden(res, "Invalid refresh token");
     }
 
     const newAccessToken = generateAccessToken(user.rows[0]);
 
-    res.json({
-      accessToken: newAccessToken,
-    });
-
+    return success(
+      res,
+      { accessToken: newAccessToken },
+      "Access token refreshed successfully"
+    );
   } catch (err) {
+    return forbidden(res, "Invalid refresh token");
+  }
+});
 
-    return res.status(403).json({
-      message: "Invalid refresh token",
-    });
+// Current user details (from access token)
+router.get("/me", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, photo, google_id
+       FROM users
+       WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return notFound(res, "User not found");
+    }
+
+    return success(res, mapUser(result.rows[0]), "User details fetched successfully");
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching user details");
+  }
+});
+
+// User details by id
+router.get("/user/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, photo, google_id
+       FROM users
+       WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return notFound(res, "User not found");
+    }
+
+    return success(res, mapUser(result.rows[0]), "User details fetched successfully");
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching user details");
   }
 });
 
 router.post("/logout", async (req, res) => {
+  try {
+    const { userId } = req.body;
 
-  const { userId } = req.body;
+    if (!userId) {
+      return unauthorized(res, "userId is required");
+    }
 
-  await pool.query(
-    "UPDATE users SET refresh_token=NULL WHERE id=$1",
-    [userId]
-  );
+    await pool.query(
+      "UPDATE users SET refresh_token=NULL WHERE id=$1",
+      [userId]
+    );
 
-  res.json({
-    message: "Logged out",
-  });
+    return success(res, null, "Logged out");
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error logging out");
+  }
 });
 
 module.exports = router;
