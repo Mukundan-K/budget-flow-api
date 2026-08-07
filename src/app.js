@@ -14,9 +14,17 @@ const categoryRoutes = require("./routes/category.routes");
 const masterRoutes = require("./routes/master.routes");
 const paymentTypeRoutes = require("./routes/paymentType.routes");
 const paymentRoutes = require("./routes/payment.routes");
+const emiProductRoutes = require("./routes/emiProduct.routes");
 const overviewRoutes = require("./routes/overview.routes");
+const bankAccountRoutes = require("./routes/bankAccount.routes");
+const savingRoutes = require("./routes/saving.routes");
+const debtRoutes = require("./routes/debt.routes");
 const seedDefaultCategories = require("./seed/defaultCategories");
 const seedPayments = require("./seed/payments");
+const seedExpenseSplits = require("./seed/expenseSplits");
+const seedSavings = require("./seed/savings");
+const seedReturns = require("./seed/returns");
+const seedDebts = require("./seed/debts");
 
 const app = express();
 
@@ -34,10 +42,16 @@ app.use("/api/categories", categoryRoutes);
 app.use("/api/masters", masterRoutes);
 app.use("/api/payment-types", paymentTypeRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/emi-products", emiProductRoutes);
 app.use("/api/overview", overviewRoutes);
+app.use("/api/bank-accounts", bankAccountRoutes);
+app.use("/api/savings", savingRoutes);
+app.use("/api/debts", debtRoutes);
 
-Promise.all([seedDefaultCategories(), seedPayments()]).then(() => {
-  app.listen(process.env.PORT, () => {
-    console.log(`Server running on http://localhost:${process.env.PORT}`);
+Promise.all([seedDefaultCategories(), seedPayments(), seedSavings(), seedDebts()])
+  .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))
+  .then(() => {
+    app.listen(process.env.PORT, () => {
+      console.log(`Server running on http://localhost:${process.env.PORT}`);
+    });
   });
-});

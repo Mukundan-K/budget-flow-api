@@ -6,33 +6,49 @@ const {
   created,
   badRequest,
   notFound,
+  conflict,
   serverError,
 } = require("../utils/response");
-
-function todayDate() {
-  return new Date().toISOString().slice(0, 10);
-}
+const { parseAmount, formatAmount } = require("../utils/money");
+const {
+  nowTimestamp,
+  parseTimestamp,
+  formatTimestamp,
+  dayStart,
+  dayEnd,
+  monthRangeTimestamps,
+} = require("../utils/datetime");
 
 function toAmount(value) {
-  const amount = Number(value);
-  if (Number.isNaN(amount)) return null;
-  return Math.round(amount * 100) / 100;
+  return parseAmount(value);
 }
 
-function toDateOnly(value) {
-  if (value === undefined || value === null || value === "") return undefined;
-  const d = new Date(`${value}T00:00:00.000Z`);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
+function isEmiType(typeRow) {
+  return typeRow && String(typeRow.name).trim().toLowerCase() === "emi";
+}
+
+function mapEmiProduct(row) {
+  if (!row || !row.emi_product_id) return null;
+  return {
+    id: row.emi_product_id,
+    product_name: row.emi_product_name,
+    start_date: formatTimestamp(row.emi_start_from),
+    already_paid: row.already_paid != null ? Number(row.already_paid) : 0,
+    number_of_emis: row.number_of_emis != null ? Number(row.number_of_emis) : null,
+  };
 }
 
 function mapPayment(row) {
+  const amount = formatAmount(row.amount);
+  const returned_amount = formatAmount(row.returned_amount || 0);
+  const net_amount = formatAmount(amount - returned_amount);
   return {
     id: row.id,
-    amount: toAmount(row.amount),
-    date: row.payment_date
-      ? new Date(row.payment_date).toISOString().slice(0, 10)
-      : row.payment_date,
+    amount,
+    returned_amount,
+    net_amount,
+    my_contribution: net_amount,
+    date: formatTimestamp(row.payment_date),
     user_id: row.user_id,
     payment_type_id: row.payment_type_id,
     payment_type: row.payment_type_name
@@ -42,7 +58,21 @@ function mapPayment(row) {
           is_income: Boolean(row.payment_type_is_income),
         }
       : undefined,
-    created_at: row.created_at,
+    emi_product_id: row.emi_product_id || null,
+    product_name: row.emi_product_name || null,
+    emi: mapEmiProduct(row),
+    created_at: formatTimestamp(row.created_at) || row.created_at,
+  };
+}
+
+function mapPaymentReturn(row) {
+  return {
+    id: row.id,
+    payment_id: row.payment_id,
+    user_id: row.user_id,
+    amount: formatAmount(row.amount),
+    date: formatTimestamp(row.return_date),
+    created_at: formatTimestamp(row.created_at) || row.created_at,
   };
 }
 
@@ -74,22 +104,138 @@ function validatePaymentPayload(body, { partial = false } = {}) {
   }
 
   if (body.date !== undefined && body.date !== null && body.date !== "") {
-    if (toDateOnly(body.date) === null) {
-      errors.push("date must be a valid date (YYYY-MM-DD)");
+    if (parseTimestamp(body.date) === null) {
+      errors.push("date must be a valid date or timestamp");
     }
   }
 
   return errors;
 }
 
+function validateEmiPayload(emi) {
+  const errors = [];
+
+  if (!emi || typeof emi !== "object") {
+    return ["emi details are required for EMI payments"];
+  }
+
+  const mode = String(emi.mode || "").trim().toLowerCase();
+  if (mode !== "existing" && mode !== "new") {
+    errors.push("emi.mode must be 'existing' or 'new'");
+    return errors;
+  }
+
+  if (mode === "existing") {
+    if (
+      emi.emi_product_id === undefined ||
+      emi.emi_product_id === null ||
+      emi.emi_product_id === ""
+    ) {
+      errors.push("emi.emi_product_id is required for existing EMI");
+    }
+  }
+
+  if (mode === "new") {
+    if (!emi.product_name || String(emi.product_name).trim() === "") {
+      errors.push("emi.product_name is required for new EMI");
+    }
+
+    const startDate = emi.start_date || emi.emi_start_from;
+    if (!startDate) {
+      errors.push("emi.start_date is required for new EMI");
+    } else if (parseTimestamp(startDate) === null) {
+      errors.push("emi.start_date must be a valid date or timestamp");
+    }
+
+    const count = Number(emi.number_of_emis);
+    if (
+      emi.number_of_emis === undefined ||
+      emi.number_of_emis === null ||
+      emi.number_of_emis === ""
+    ) {
+      errors.push("emi.number_of_emis is required for new EMI");
+    } else if (!Number.isInteger(count) || count <= 0) {
+      errors.push("emi.number_of_emis must be a positive integer");
+    }
+
+    if (
+      emi.already_paid === undefined ||
+      emi.already_paid === null ||
+      emi.already_paid === ""
+    ) {
+      errors.push("emi.already_paid is required for new EMI");
+    } else {
+      const paid = Number(emi.already_paid);
+      if (!Number.isInteger(paid) || paid < 0) {
+        errors.push("emi.already_paid must be an integer >= 0");
+      } else if (Number.isInteger(count) && count > 0 && paid > count) {
+        errors.push("emi.already_paid cannot be greater than number_of_emis");
+      }
+    }
+  }
+
+  return errors;
+}
+
+async function resolveEmiProductId(userId, emi) {
+  const mode = String(emi.mode).trim().toLowerCase();
+
+  if (mode === "existing") {
+    const existing = await db.query(
+      `SELECT id FROM emi_products
+       WHERE id = $1 AND user_id = $2`,
+      [emi.emi_product_id, userId]
+    );
+    if (existing.rows.length === 0) {
+      return { error: "emi_product_id is invalid for this user" };
+    }
+    return { emi_product_id: existing.rows[0].id };
+  }
+
+  const product_name = String(emi.product_name).trim();
+  const emi_start_from = parseTimestamp(emi.start_date || emi.emi_start_from);
+  const number_of_emis = Number(emi.number_of_emis);
+  const already_paid = Number(emi.already_paid);
+
+  try {
+    const createdProduct = await db.query(
+      `INSERT INTO emi_products
+         (user_id, product_name, emi_start_from, already_paid, number_of_emis)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [userId, product_name, emi_start_from, already_paid, number_of_emis]
+    );
+    return { emi_product_id: createdProduct.rows[0].id };
+  } catch (err) {
+    if (err.code === "23505") {
+      return {
+        error: "EMI product with this name already exists for the user",
+      };
+    }
+    throw err;
+  }
+}
+
 const PAYMENT_SELECT = `
-  SELECT p.id, p.amount, p.payment_date, p.user_id, p.payment_type_id, p.created_at,
-         pt.name AS payment_type_name, pt.is_income AS payment_type_is_income
+  SELECT p.id, p.amount, p.payment_date, p.user_id, p.payment_type_id,
+         p.emi_product_id, p.created_at,
+         pt.name AS payment_type_name, pt.is_income AS payment_type_is_income,
+         ep.product_name AS emi_product_name,
+         ep.emi_start_from,
+         ep.already_paid,
+         ep.number_of_emis,
+         COALESCE(ret.returned_amount, 0) AS returned_amount
   FROM payments p
   JOIN payment_types pt ON pt.id = p.payment_type_id
+  LEFT JOIN emi_products ep ON ep.id = p.emi_product_id
+  LEFT JOIN (
+    SELECT payment_id, SUM(amount) AS returned_amount
+    FROM payment_returns
+    GROUP BY payment_id
+  ) ret ON ret.payment_id = p.id
 `;
 
-// Create payment (salary, rent, etc.)
+// Create payment (salary, rent, EMI, etc.)
 router.post("/", async (req, res) => {
   try {
     const errors = validatePaymentPayload(req.body);
@@ -98,23 +244,43 @@ router.post("/", async (req, res) => {
     }
 
     const typeCheck = await db.query(
-      `SELECT id FROM payment_types WHERE id = $1`,
+      `SELECT id, name, is_income FROM payment_types WHERE id = $1`,
       [req.body.payment_type_id]
     );
     if (typeCheck.rows.length === 0) {
       return badRequest(res, "payment_type_id is invalid");
     }
 
+    const paymentType = typeCheck.rows[0];
+    let emi_product_id = null;
+
+    if (isEmiType(paymentType)) {
+      const emiErrors = validateEmiPayload(req.body.emi);
+      if (emiErrors.length) {
+        return badRequest(res, emiErrors.join(", "));
+      }
+
+      const resolved = await resolveEmiProductId(req.body.user_id, req.body.emi);
+      if (resolved.error) {
+        if (resolved.error.includes("already exists")) {
+          return conflict(res, resolved.error);
+        }
+        return badRequest(res, resolved.error);
+      }
+      emi_product_id = resolved.emi_product_id;
+    }
+
     const amount = toAmount(req.body.amount);
     const user_id = req.body.user_id;
     const payment_type_id = req.body.payment_type_id;
-    const payment_date = toDateOnly(req.body.date) || todayDate();
+    const payment_date = parseTimestamp(req.body.date) || nowTimestamp();
 
     const result = await db.query(
-      `INSERT INTO payments (amount, payment_date, user_id, payment_type_id)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO payments
+         (amount, payment_date, user_id, payment_type_id, emi_product_id)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING id`,
-      [amount, payment_date, user_id, payment_type_id]
+      [amount, payment_date, user_id, payment_type_id, emi_product_id]
     );
 
     const createdPayment = await db.query(
@@ -134,9 +300,10 @@ router.post("/", async (req, res) => {
 });
 
 // List payments
+// GET /api/payments?user_id=2&month=8&year=2026
 router.get("/", async (req, res) => {
   try {
-    const { user_id, payment_type_id, date } = req.query;
+    const { user_id, payment_type_id, date, month, year } = req.query;
     const conditions = [];
     const params = [];
 
@@ -149,12 +316,36 @@ router.get("/", async (req, res) => {
       conditions.push(`p.payment_type_id = $${params.length}`);
     }
     if (date) {
-      const paymentDate = toDateOnly(date);
-      if (!paymentDate) {
-        return badRequest(res, "date must be a valid date (YYYY-MM-DD)");
+      const start = dayStart(date);
+      const end = dayEnd(date);
+      if (!start || !end) {
+        return badRequest(res, "date must be a valid date or timestamp");
       }
-      params.push(paymentDate);
-      conditions.push(`p.payment_date = $${params.length}`);
+      params.push(start);
+      conditions.push(`p.payment_date >= $${params.length}`);
+      params.push(end);
+      conditions.push(`p.payment_date <= $${params.length}`);
+    } else if (month || year) {
+      const now = new Date();
+      const selectedYear = year ? Number(year) : now.getUTCFullYear();
+      const selectedMonth = month ? Number(month) : now.getUTCMonth() + 1;
+
+      if (
+        !Number.isInteger(selectedMonth) ||
+        selectedMonth < 1 ||
+        selectedMonth > 12
+      ) {
+        return badRequest(res, "month must be an integer between 1 and 12");
+      }
+      if (!Number.isInteger(selectedYear) || selectedYear < 2000) {
+        return badRequest(res, "year must be a valid year");
+      }
+
+      const range = monthRangeTimestamps(selectedYear, selectedMonth);
+      params.push(range.start);
+      conditions.push(`p.payment_date >= $${params.length}`);
+      params.push(range.end);
+      conditions.push(`p.payment_date <= $${params.length}`);
     }
 
     const whereClause = conditions.length
@@ -179,6 +370,132 @@ router.get("/", async (req, res) => {
   }
 });
 
+// List returns for a payment
+router.get("/:id/returns", async (req, res) => {
+  try {
+    const payment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
+    if (payment.rows.length === 0) {
+      return notFound(res, "Payment not found");
+    }
+
+    const result = await db.query(
+      `SELECT * FROM payment_returns
+       WHERE payment_id = $1
+       ORDER BY return_date DESC, id DESC`,
+      [req.params.id]
+    );
+
+    return success(
+      res,
+      {
+        payment: mapPayment(payment.rows[0]),
+        returns: result.rows.map(mapPaymentReturn),
+      },
+      "Payment returns fetched successfully"
+    );
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching payment returns");
+  }
+});
+
+// Add return against a payment
+router.post("/:id/returns", async (req, res) => {
+  try {
+    const payment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
+    if (payment.rows.length === 0) {
+      return notFound(res, "Payment not found");
+    }
+
+    const amount = toAmount(req.body.amount);
+    if (amount === null || amount <= 0) {
+      return badRequest(res, "amount must be a positive number");
+    }
+
+    const user_id = req.body.user_id ?? payment.rows[0].user_id;
+    if (String(user_id) !== String(payment.rows[0].user_id)) {
+      return badRequest(res, "user_id does not match payment owner");
+    }
+
+    if (req.body.date !== undefined && req.body.date !== null && req.body.date !== "") {
+      if (parseTimestamp(req.body.date) === null) {
+        return badRequest(res, "date must be a valid date or timestamp");
+      }
+    }
+    const return_date = parseTimestamp(req.body.date) || nowTimestamp();
+
+    const paymentAmount = formatAmount(payment.rows[0].amount);
+    const alreadyReturned = formatAmount(payment.rows[0].returned_amount || 0);
+    const remaining = formatAmount(paymentAmount - alreadyReturned);
+
+    if (amount > remaining) {
+      return badRequest(
+        res,
+        `return amount exceeds remaining payment amount (available: ${remaining})`
+      );
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO payment_returns (payment_id, user_id, amount, return_date)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [req.params.id, user_id, amount, return_date]
+    );
+
+    const updatedPayment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
+
+    return created(
+      res,
+      {
+        return: mapPaymentReturn(inserted.rows[0]),
+        payment: mapPayment(updatedPayment.rows[0]),
+      },
+      "Payment return added successfully"
+    );
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error adding payment return");
+  }
+});
+
+// Delete a payment return
+router.delete("/:id/returns/:returnId", async (req, res) => {
+  try {
+    const result = await db.query(
+      `DELETE FROM payment_returns
+       WHERE id = $1 AND payment_id = $2
+       RETURNING *`,
+      [req.params.returnId, req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return notFound(res, "Payment return not found");
+    }
+
+    const payment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
+
+    return success(
+      res,
+      {
+        return: mapPaymentReturn(result.rows[0]),
+        payment: payment.rows[0] ? mapPayment(payment.rows[0]) : null,
+      },
+      "Payment return deleted successfully"
+    );
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error deleting payment return");
+  }
+});
+
 // Get one
 router.get("/:id", async (req, res) => {
   try {
@@ -191,7 +508,21 @@ router.get("/:id", async (req, res) => {
       return notFound(res, "Payment not found");
     }
 
-    return success(res, mapPayment(result.rows[0]), "Payment fetched successfully");
+    const returns = await db.query(
+      `SELECT * FROM payment_returns
+       WHERE payment_id = $1
+       ORDER BY return_date DESC, id DESC`,
+      [req.params.id]
+    );
+
+    return success(
+      res,
+      {
+        ...mapPayment(result.rows[0]),
+        returns: returns.rows.map(mapPaymentReturn),
+      },
+      "Payment fetched successfully"
+    );
   } catch (err) {
     console.error(err);
     return serverError(res, "Error fetching payment");
@@ -207,27 +538,47 @@ router.put("/:id", async (req, res) => {
     }
 
     const typeCheck = await db.query(
-      `SELECT id FROM payment_types WHERE id = $1`,
+      `SELECT id, name, is_income FROM payment_types WHERE id = $1`,
       [req.body.payment_type_id]
     );
     if (typeCheck.rows.length === 0) {
       return badRequest(res, "payment_type_id is invalid");
     }
 
+    const paymentType = typeCheck.rows[0];
+    let emi_product_id = null;
+
+    if (isEmiType(paymentType)) {
+      const emiErrors = validateEmiPayload(req.body.emi);
+      if (emiErrors.length) {
+        return badRequest(res, emiErrors.join(", "));
+      }
+
+      const resolved = await resolveEmiProductId(req.body.user_id, req.body.emi);
+      if (resolved.error) {
+        if (resolved.error.includes("already exists")) {
+          return conflict(res, resolved.error);
+        }
+        return badRequest(res, resolved.error);
+      }
+      emi_product_id = resolved.emi_product_id;
+    }
+
     const amount = toAmount(req.body.amount);
     const user_id = req.body.user_id;
     const payment_type_id = req.body.payment_type_id;
-    const payment_date = toDateOnly(req.body.date) || todayDate();
+    const payment_date = parseTimestamp(req.body.date) || nowTimestamp();
 
     const result = await db.query(
       `UPDATE payments
        SET amount = $1,
            payment_date = $2,
            user_id = $3,
-           payment_type_id = $4
-       WHERE id = $5
+           payment_type_id = $4,
+           emi_product_id = $5
+       WHERE id = $6
        RETURNING id`,
-      [amount, payment_date, user_id, payment_type_id, req.params.id]
+      [amount, payment_date, user_id, payment_type_id, emi_product_id, req.params.id]
     );
 
     if (result.rows.length === 0) {
@@ -249,7 +600,7 @@ router.put("/:id", async (req, res) => {
 router.patch("/:id", async (req, res) => {
   try {
     const existing = await db.query(
-      `SELECT id, amount, payment_date, user_id, payment_type_id
+      `SELECT id, amount, payment_date, user_id, payment_type_id, emi_product_id
        FROM payments WHERE id = $1`,
       [req.params.id]
     );
@@ -270,19 +621,36 @@ router.patch("/:id", async (req, res) => {
         : toAmount(current.amount);
     const payment_date =
       req.body.date !== undefined
-        ? toDateOnly(req.body.date) || todayDate()
-        : toDateOnly(current.payment_date) || todayDate();
+        ? parseTimestamp(req.body.date) || nowTimestamp()
+        : parseTimestamp(current.payment_date) || nowTimestamp();
     const user_id = req.body.user_id ?? current.user_id;
     const payment_type_id = req.body.payment_type_id ?? current.payment_type_id;
+    let emi_product_id = current.emi_product_id;
 
-    if (req.body.payment_type_id !== undefined) {
-      const typeCheck = await db.query(
-        `SELECT id FROM payment_types WHERE id = $1`,
-        [payment_type_id]
-      );
-      if (typeCheck.rows.length === 0) {
-        return badRequest(res, "payment_type_id is invalid");
+    const typeCheck = await db.query(
+      `SELECT id, name, is_income FROM payment_types WHERE id = $1`,
+      [payment_type_id]
+    );
+    if (typeCheck.rows.length === 0) {
+      return badRequest(res, "payment_type_id is invalid");
+    }
+
+    const paymentType = typeCheck.rows[0];
+    if (isEmiType(paymentType) && req.body.emi !== undefined) {
+      const emiErrors = validateEmiPayload(req.body.emi);
+      if (emiErrors.length) {
+        return badRequest(res, emiErrors.join(", "));
       }
+      const resolved = await resolveEmiProductId(user_id, req.body.emi);
+      if (resolved.error) {
+        if (resolved.error.includes("already exists")) {
+          return conflict(res, resolved.error);
+        }
+        return badRequest(res, resolved.error);
+      }
+      emi_product_id = resolved.emi_product_id;
+    } else if (!isEmiType(paymentType)) {
+      emi_product_id = null;
     }
 
     await db.query(
@@ -290,9 +658,10 @@ router.patch("/:id", async (req, res) => {
        SET amount = $1,
            payment_date = $2,
            user_id = $3,
-           payment_type_id = $4
-       WHERE id = $5`,
-      [amount, payment_date, user_id, payment_type_id, req.params.id]
+           payment_type_id = $4,
+           emi_product_id = $5
+       WHERE id = $6`,
+      [amount, payment_date, user_id, payment_type_id, emi_product_id, req.params.id]
     );
 
     const updated = await db.query(
