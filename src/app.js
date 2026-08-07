@@ -19,6 +19,7 @@ const overviewRoutes = require("./routes/overview.routes");
 const bankAccountRoutes = require("./routes/bankAccount.routes");
 const savingRoutes = require("./routes/saving.routes");
 const debtRoutes = require("./routes/debt.routes");
+const seedSchema = require("./seed/schema");
 const seedDefaultCategories = require("./seed/defaultCategories");
 const seedPayments = require("./seed/payments");
 const seedExpenseSplits = require("./seed/expenseSplits");
@@ -48,7 +49,16 @@ app.use("/api/bank-accounts", bankAccountRoutes);
 app.use("/api/savings", savingRoutes);
 app.use("/api/debts", debtRoutes);
 
-Promise.all([seedDefaultCategories(), seedPayments(), seedSavings(), seedDebts()])
+// Schema first (users/expenses/monthly_balances), then feature tables
+seedSchema()
+  .then(() =>
+    Promise.all([
+      seedDefaultCategories(),
+      seedPayments(),
+      seedSavings(),
+      seedDebts(),
+    ])
+  )
   .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))
   .then(() => {
     app.listen(process.env.PORT, () => {

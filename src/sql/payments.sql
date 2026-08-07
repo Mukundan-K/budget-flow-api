@@ -1,3 +1,5 @@
+-- Payments domain (see also schema.sql)
+
 CREATE TABLE IF NOT EXISTS payment_types (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) NOT NULL UNIQUE,
@@ -24,7 +26,6 @@ CREATE TABLE IF NOT EXISTS payments (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   payment_type_id INTEGER NOT NULL REFERENCES payment_types(id) ON DELETE RESTRICT,
   emi_product_id INTEGER REFERENCES emi_products(id) ON DELETE SET NULL,
-  note TEXT,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -40,8 +41,3 @@ CREATE TABLE IF NOT EXISTS monthly_balances (
   updated_at TIMESTAMP DEFAULT NOW(),
   UNIQUE (user_id, month, year)
 );
-
--- Migrate existing DATE columns if needed:
--- ALTER TABLE payments ALTER COLUMN payment_date TYPE TIMESTAMPTZ USING payment_date::timestamptz;
--- ALTER TABLE emi_products ALTER COLUMN emi_start_from TYPE TIMESTAMPTZ USING emi_start_from::timestamptz;
--- ALTER TABLE expenses ALTER COLUMN expense_date TYPE TIMESTAMPTZ USING expense_date::timestamptz;
