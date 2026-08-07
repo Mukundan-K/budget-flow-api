@@ -1,4 +1,8 @@
 const db = require("../db");
+const {
+  migrateColumnToTimestamptz,
+  migrateColumnToNumeric,
+} = require("./schema");
 
 async function seedPayments() {
   try {
@@ -9,23 +13,6 @@ async function seedPayments() {
         is_income BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS payments (
-        id SERIAL PRIMARY KEY,
-        amount NUMERIC(18, 8) NOT NULL,
-        payment_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        payment_type_id INTEGER NOT NULL REFERENCES payment_types(id) ON DELETE RESTRICT,
-        note TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_payments_user_date
-        ON payments (user_id, payment_date)
     `);
 
     await db.query(`
@@ -42,98 +29,58 @@ async function seedPayments() {
       )
     `);
 
-    // Add already_paid to emi_products if missing
     await db.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'emi_products' AND column_name = 'already_paid'
-        ) THEN
-          ALTER TABLE emi_products
-            ADD COLUMN already_paid INTEGER NOT NULL DEFAULT 0
-            CHECK (already_paid >= 0);
-        END IF;
-      END $$;
+      CREATE TABLE IF NOT EXISTS payments (
+        id SERIAL PRIMARY KEY,
+        amount NUMERIC(18, 8) NOT NULL,
+        payment_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        payment_type_id INTEGER NOT NULL REFERENCES payment_types(id) ON DELETE RESTRICT,
+        emi_product_id INTEGER REFERENCES emi_products(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
     `);
 
-    // Add emi_product_id to payments if missing
+    // Legacy cleanup — unused column
+    await db.query(`ALTER TABLE payments DROP COLUMN IF EXISTS note`);
+
+    // Older DBs: add emi_product_id if table was created without it
+    const emiCol = await db.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'payments'
+         AND column_name = 'emi_product_id'`
+    );
+    if (emiCol.rows.length === 0) {
+      await db.query(`
+        ALTER TABLE payments
+          ADD COLUMN emi_product_id INTEGER
+          REFERENCES emi_products(id) ON DELETE SET NULL
+      `);
+    }
+
+    const alreadyPaidCol = await db.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'emi_products'
+         AND column_name = 'already_paid'`
+    );
+    if (alreadyPaidCol.rows.length === 0) {
+      await db.query(`
+        ALTER TABLE emi_products
+          ADD COLUMN already_paid INTEGER NOT NULL DEFAULT 0
+          CHECK (already_paid >= 0)
+      `);
+    }
+
     await db.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'payments' AND column_name = 'emi_product_id'
-        ) THEN
-          ALTER TABLE payments
-            ADD COLUMN emi_product_id INTEGER
-            REFERENCES emi_products(id) ON DELETE SET NULL;
-        END IF;
-      END $$;
+      CREATE INDEX IF NOT EXISTS idx_payments_user_date
+        ON payments (user_id, payment_date)
     `);
 
-    // Expand amount precision + migrate date columns to timestamptz
-    await db.query(`
-      DO $$
-      BEGIN
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'payments' AND column_name = 'amount'
-        ) THEN
-          ALTER TABLE payments
-            ALTER COLUMN amount TYPE NUMERIC(18, 8);
-        END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'payments' AND column_name = 'payment_date'
-            AND data_type = 'date'
-        ) THEN
-          ALTER TABLE payments
-            ALTER COLUMN payment_date TYPE TIMESTAMPTZ
-            USING payment_date::timestamp AT TIME ZONE;
-          ALTER TABLE payments
-            ALTER COLUMN payment_date SET DEFAULT NOW();
-        END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'emi_products' AND column_name = 'emi_start_from'
-            AND data_type = 'date'
-        ) THEN
-          ALTER TABLE emi_products
-            ALTER COLUMN emi_start_from TYPE TIMESTAMPTZ
-            USING emi_start_from::timestamp AT TIME ZONE;
-        END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'expenses' AND column_name = 'amount'
-        ) THEN
-          ALTER TABLE expenses
-            ALTER COLUMN amount TYPE NUMERIC(18, 8);
-        END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'expenses' AND column_name = 'expense_date'
-            AND data_type = 'date'
-        ) THEN
-          ALTER TABLE expenses
-            ALTER COLUMN expense_date TYPE TIMESTAMPTZ
-            USING expense_date::timestamp AT TIME ZONE;
-        END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'monthly_balances'
-            AND column_name = 'previous_month_balance'
-        ) THEN
-          ALTER TABLE monthly_balances
-            ALTER COLUMN previous_month_balance TYPE NUMERIC(18, 8);
-        END IF;
-      END $$;
-    `);
+    await migrateColumnToTimestamptz("payments", "payment_date");
+    await migrateColumnToTimestamptz("emi_products", "emi_start_from");
+    await migrateColumnToNumeric("payments", "amount");
 
     await db.query(
       `INSERT INTO payment_types (name, is_income)
@@ -142,7 +89,6 @@ async function seedPayments() {
       ["Salary", true, "Rent", false, "EMI", false]
     );
 
-    // Drop legacy salaries table if it exists
     await db.query(`DROP TABLE IF EXISTS salaries CASCADE`);
   } catch (error) {
     console.error("Failed to seed payments:", error.message);
