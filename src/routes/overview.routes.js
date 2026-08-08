@@ -226,8 +226,83 @@ async function getExpenseTypeNetsForMonth(userId, year, month) {
 
 /**
  * Category breakdown for Polar Area Chart (split-aware, after returns).
- * Ready for ApexCharts / Chart.js: labels + series, plus slices with %.
+ * Ready for ApexCharts / Chart.js: labels + series + colors, plus slices with %.
+ * Unnecessary-dominant categories get red shades; others get a non-red palette.
  */
+const POLAR_NECESSARY_COLORS = [
+  // Green shades — darkest → lightest (highest expense → darker green)
+  "#198754",
+  "#20C997",
+  "#2F9E44",
+  "#40C057",
+  "#51CF66",
+  "#69DB7C",
+  "#8CE99A",
+  "#B2F2BB",
+];
+
+const POLAR_UNNECESSARY_RED_SHADES = [
+  // Danger red — milder dark → light (highest expense → first)
+  "#DC3545",
+  "#E35D6A",
+  "#EA868F",
+  "#F1B0B7",
+  "#F5C2C7",
+  "#F8D7DA",
+  "#FAE3E5",
+];
+
+function isUnnecessaryDominant(slice) {
+  const unnecessary = Number(slice.unnecessary_total) || 0;
+  const necessary = Number(slice.necessary_total) || 0;
+  return unnecessary > 0 && unnecessary >= necessary;
+}
+
+function assignPolarAreaColors(slices) {
+  const unnecessaryRanks = slices
+    .map((slice, index) => ({
+      index,
+      total: Number(slice.total) || 0,
+      is_unnecessary: isUnnecessaryDominant(slice),
+    }))
+    .filter((item) => item.is_unnecessary)
+    .sort((a, b) => b.total - a.total);
+
+  const necessaryRanks = slices
+    .map((slice, index) => ({
+      index,
+      total: Number(slice.total) || 0,
+      is_unnecessary: isUnnecessaryDominant(slice),
+    }))
+    .filter((item) => !item.is_unnecessary)
+    .sort((a, b) => b.total - a.total);
+
+  const colorByIndex = {};
+
+  unnecessaryRanks.forEach((item, rank) => {
+    colorByIndex[item.index] =
+      POLAR_UNNECESSARY_RED_SHADES[
+        Math.min(rank, POLAR_UNNECESSARY_RED_SHADES.length - 1)
+      ];
+  });
+
+  necessaryRanks.forEach((item, rank) => {
+    colorByIndex[item.index] =
+      POLAR_NECESSARY_COLORS[
+        Math.min(rank, POLAR_NECESSARY_COLORS.length - 1)
+      ];
+  });
+
+  return slices.map((slice, index) => {
+    const is_unnecessary = isUnnecessaryDominant(slice);
+    return {
+      ...slice,
+      color: colorByIndex[index],
+      is_unnecessary,
+    };
+  });
+}
+
 async function getCategoryPolarArea(userId, start, end) {
   const result = await db.query(
     `SELECT
@@ -283,16 +358,19 @@ async function getCategoryPolarArea(userId, start, end) {
     slices.reduce((sum, s) => sum + s.total, 0)
   );
 
-  const withPct = slices.map((s) => ({
-    ...s,
-    percentage:
-      grand_total > 0 ? roundMoney((s.total / grand_total) * 100) : 0,
-  }));
+  const withPct = assignPolarAreaColors(
+    slices.map((s) => ({
+      ...s,
+      percentage:
+        grand_total > 0 ? roundMoney((s.total / grand_total) * 100) : 0,
+    }))
+  );
 
   return {
     grand_total,
     labels: withPct.map((s) => s.category),
     series: withPct.map((s) => s.total),
+    colors: withPct.map((s) => s.color),
     slices: withPct,
   };
 }
@@ -304,6 +382,458 @@ function periodRange(year, month, mode) {
     return { start: jan.start, end: dec.end };
   }
   return monthRange(year, month);
+}
+
+function pct(part, whole) {
+  return whole > 0 ? roundMoney((part / whole) * 100) : 0;
+}
+
+/** Donut / pie — necessary vs unnecessary expenses */
+const EXPENSE_TYPE_COLORS = {
+  necessary: "#198754", // green
+  unnecessary: "#DC3545", // danger red
+};
+
+function buildExpenseTypeChart(necessary, unnecessary) {
+  const slices = [
+    {
+      label: "Necessary",
+      key: "necessary",
+      total: necessary,
+      color: EXPENSE_TYPE_COLORS.necessary,
+      is_unnecessary: false,
+    },
+    {
+      label: "Unnecessary",
+      key: "unnecessary",
+      total: unnecessary,
+      color: EXPENSE_TYPE_COLORS.unnecessary,
+      is_unnecessary: true,
+    },
+  ].filter((s) => s.total > 0);
+
+  const grand_total = roundMoney(necessary + unnecessary);
+
+  return {
+    type: "donut",
+    title: "Necessary vs Unnecessary",
+    grand_total,
+    labels: slices.map((s) => s.label),
+    series: slices.map((s) => s.total),
+    colors: slices.map((s) => s.color),
+    slices: slices.map((s) => ({
+      ...s,
+      percentage: pct(s.total, grand_total),
+    })),
+  };
+}
+
+/** Bar — money flow snapshot for the period */
+const CASHFLOW_GREEN = "#198754";
+const CASHFLOW_RED = "#DC3545";
+
+function cashflowPositiveColor(value) {
+  return Number(value) > 0 ? CASHFLOW_GREEN : CASHFLOW_RED;
+}
+
+function cashflowNonNegativeColor(value) {
+  return Number(value) >= 0 ? CASHFLOW_GREEN : CASHFLOW_RED;
+}
+
+function resolveCashflowColor(key, total, available) {
+  const value = Number(total) || 0;
+  const availableAmt = Number(available) || 0;
+
+  switch (key) {
+    case "income":
+    case "available":
+      return cashflowPositiveColor(value);
+    case "previous_balance":
+      // Carry-forward: green when positive, red when not
+      return cashflowPositiveColor(value);
+    case "spent":
+      // Green when spending is under available, else red
+      return value < availableAmt ? CASHFLOW_GREEN : CASHFLOW_RED;
+    case "from_savings":
+      // Red when negative (net pull hurts); green otherwise
+      return cashflowNonNegativeColor(value);
+    case "debt":
+      // Positive debt burden → red; zero/negative → green
+      return value > 0 ? CASHFLOW_RED : CASHFLOW_GREEN;
+    case "balance":
+      // Green when positive, red when zero/negative
+      return cashflowPositiveColor(value);
+    default:
+      return cashflowPositiveColor(value);
+  }
+}
+
+function buildCashflowChart({
+  income,
+  previous_balance,
+  available,
+  spent,
+  from_savings,
+  debt,
+  balance,
+}) {
+  const items = [
+    { label: "Income", key: "income", total: income },
+    { label: "Prev. balance", key: "previous_balance", total: previous_balance },
+    { label: "Available", key: "available", total: available },
+    { label: "Spent", key: "spent", total: spent },
+    { label: "From savings", key: "from_savings", total: from_savings },
+    { label: "Debt", key: "debt", total: debt },
+    { label: "Balance", key: "balance", total: balance },
+  ].map((item) => ({
+    ...item,
+    color: resolveCashflowColor(item.key, item.total, available),
+  }));
+
+  return {
+    type: "bar",
+    title: "Cash flow",
+    labels: items.map((i) => i.label),
+    series: items.map((i) => i.total),
+    colors: items.map((i) => i.color),
+    items,
+  };
+}
+
+/** Donut — spending by expenses + each outgoing payment type (EMI grouped by product) */
+const SPENDING_BREAKDOWN_FIXED_COLORS = {
+  expenses: "#4F46E5", // indigo
+  from_savings: "#0D9488", // deep teal
+  debt: "#E11D48", // crimson
+  emi: "#EA580C", // vivid orange
+};
+
+const SPENDING_PAYMENT_TYPE_COLORS = [
+  "#7C3AED", // violet
+  "#059669", // emerald
+  "#DB2777", // magenta
+  "#0284C7", // blue
+  "#CA8A04", // gold
+  "#C026D3", // fuchsia
+  "#16A34A", // green
+  "#0891B2", // cyan
+  "#D97706", // amber
+  "#9333EA", // purple
+];
+
+/**
+ * Outgoing (non-income) payments grouped by payment type.
+ * EMI includes full product details in groups[] for the spending-breakdown chart.
+ */
+async function getOutgoingPaymentsGrouped(userId, start, end) {
+  const result = await db.query(
+    `SELECT
+       pt.id AS payment_type_id,
+       pt.name AS payment_type_name,
+       ep.id AS emi_product_id,
+       ep.product_name AS emi_product_name,
+       ep.emi_start_from,
+       ep.already_paid,
+       ep.number_of_emis,
+       COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total,
+       COUNT(p.id)::int AS count
+     FROM payments p
+     JOIN payment_types pt ON pt.id = p.payment_type_id
+     LEFT JOIN emi_products ep ON ep.id = p.emi_product_id
+     LEFT JOIN (
+       SELECT payment_id, SUM(amount) AS returned_amount
+       FROM payment_returns
+       GROUP BY payment_id
+     ) ret ON ret.payment_id = p.id
+     WHERE p.user_id = $1
+       AND pt.is_income = FALSE
+       AND p.payment_date >= $2
+       AND p.payment_date <= $3
+     GROUP BY
+       pt.id,
+       pt.name,
+       ep.id,
+       ep.product_name,
+       ep.emi_start_from,
+       ep.already_paid,
+       ep.number_of_emis
+     HAVING COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) > 0
+     ORDER BY total DESC`,
+    [userId, start, end]
+  );
+
+  const byType = {};
+
+  result.rows.forEach((row) => {
+    const typeId = row.payment_type_id;
+    const typeName = String(row.payment_type_name || "").trim();
+    const isEmi = typeName.toLowerCase() === "emi";
+    const total = toAmount(row.total);
+    const count = Number(row.count) || 0;
+
+    if (!byType[typeId]) {
+      byType[typeId] = {
+        payment_type_id: typeId,
+        label: typeName || "Payment",
+        key: isEmi ? "emi" : `payment_type_${typeId}`,
+        total: 0,
+        count: 0,
+        groups: [],
+      };
+    }
+
+    const group = byType[typeId];
+    group.total = roundMoney(group.total + total);
+    group.count += count;
+
+    if (isEmi) {
+      const already_paid =
+        row.already_paid != null ? Number(row.already_paid) : 0;
+      const number_of_emis =
+        row.number_of_emis != null ? Number(row.number_of_emis) : null;
+      const remaining =
+        number_of_emis != null
+          ? Math.max(0, number_of_emis - already_paid)
+          : null;
+
+      group.groups.push({
+        label: row.emi_product_name || "EMI",
+        product_name: row.emi_product_name || "EMI",
+        emi_product_id: row.emi_product_id || null,
+        start_date: formatTimestamp(row.emi_start_from),
+        already_paid,
+        number_of_emis,
+        remaining,
+        emis_left: remaining,
+        total,
+        amount: total,
+        count,
+        payments_this_period: count,
+      });
+    }
+  });
+
+  // EMI products: highest emis left first
+  Object.values(byType).forEach((group) => {
+    if (group.key === "emi" && group.groups.length) {
+      group.groups.sort((a, b) => {
+        const leftA = a.remaining ?? a.emis_left ?? -1;
+        const leftB = b.remaining ?? b.emis_left ?? -1;
+        if (leftB !== leftA) return leftB - leftA;
+        return (b.total || 0) - (a.total || 0);
+      });
+    }
+  });
+
+  return Object.values(byType).sort((a, b) => b.total - a.total);
+}
+
+function buildSpendingBreakdownChart({
+  expense_total,
+  from_savings,
+  debt,
+  payment_groups = [],
+}) {
+  const slices = [];
+  let paymentColorIndex = 0;
+
+  if ((expense_total || 0) > 0) {
+    slices.push({
+      label: "Expenses",
+      key: "expenses",
+      total: expense_total,
+      count: null,
+      groups: [],
+      color: SPENDING_BREAKDOWN_FIXED_COLORS.expenses,
+    });
+  }
+
+  payment_groups.forEach((group) => {
+    const isEmi = group.key === "emi";
+    const color = isEmi
+      ? SPENDING_BREAKDOWN_FIXED_COLORS.emi
+      : SPENDING_PAYMENT_TYPE_COLORS[
+          paymentColorIndex++ % SPENDING_PAYMENT_TYPE_COLORS.length
+        ];
+
+    const slice = {
+      label: group.label,
+      key: group.key,
+      payment_type_id: group.payment_type_id,
+      total: group.total,
+      count: group.count,
+      groups: group.groups || [],
+      color,
+    };
+
+    if (isEmi) {
+      slice.emi_count = group.count;
+      slice.products_count = (group.groups || []).length;
+      slice.emis = group.total;
+    }
+
+    slices.push(slice);
+  });
+
+  if ((from_savings || 0) > 0) {
+    slices.push({
+      label: "From savings",
+      key: "from_savings",
+      total: from_savings,
+      count: null,
+      groups: [],
+      color: SPENDING_BREAKDOWN_FIXED_COLORS.from_savings,
+    });
+  }
+
+  if ((debt || 0) > 0) {
+    slices.push({
+      label: "Debt",
+      key: "debt",
+      total: debt,
+      count: null,
+      groups: [],
+      color: SPENDING_BREAKDOWN_FIXED_COLORS.debt,
+    });
+  }
+
+  const filtered = slices.filter((s) => s.total > 0);
+  const grand_total = roundMoney(
+    filtered.reduce((sum, s) => sum + s.total, 0)
+  );
+
+  const emiSlice = filtered.find((s) => s.key === "emi") || null;
+
+  return {
+    type: "donut",
+    title: "Spending breakdown",
+    grand_total,
+    labels: filtered.map((s) => s.label),
+    series: filtered.map((s) => s.total),
+    colors: filtered.map((s) => s.color),
+    // EMI summary for chart details panel (replaces top-level dashboard emis fields)
+    emi: emiSlice
+      ? {
+          total: emiSlice.total,
+          emi_count: emiSlice.emi_count,
+          products_count: emiSlice.products_count,
+          color: emiSlice.color,
+          products: emiSlice.groups,
+        }
+      : null,
+    slices: filtered.map((s) => ({
+      ...s,
+      percentage: pct(s.total, grand_total),
+    })),
+  };
+}
+
+/** Line — month-by-month for a year */
+const MONTHLY_TREND_COLORS = {
+  income: "#198754", // green
+  spent: "#DC3545", // danger red
+  from_savings: "#0D9488", // teal
+  debt: "#E11D48", // crimson
+  balance: "#4F46E5", // indigo
+};
+
+function buildMonthlyTrendChart(points) {
+  const months = getMonths();
+  const labels = points.map(
+    (p) => months.find((m) => m.id === p.month)?.short || String(p.month)
+  );
+
+  const series = [
+    {
+      name: "Income",
+      key: "income",
+      color: MONTHLY_TREND_COLORS.income,
+      data: points.map((p) => p.income),
+    },
+    {
+      name: "Spent",
+      key: "spent",
+      color: MONTHLY_TREND_COLORS.spent,
+      data: points.map((p) => p.spent),
+    },
+    {
+      name: "From savings",
+      key: "from_savings",
+      color: MONTHLY_TREND_COLORS.from_savings,
+      data: points.map((p) => p.from_savings),
+    },
+    {
+      name: "Debt",
+      key: "debt",
+      color: MONTHLY_TREND_COLORS.debt,
+      data: points.map((p) => p.debt),
+    },
+    {
+      name: "Balance",
+      key: "balance",
+      color: MONTHLY_TREND_COLORS.balance,
+      data: points.map((p) => p.balance),
+    },
+  ];
+
+  return {
+    type: "line",
+    title: "Monthly trend",
+    labels,
+    colors: series.map((s) => s.color),
+    series,
+    points,
+  };
+}
+
+function attachPolarAreaMeta(polar_area) {
+  return {
+    type: "polarArea",
+    title: "Expenses by category",
+    ...polar_area,
+  };
+}
+
+function buildChartsBundle({
+  polar_area,
+  necessary,
+  unnecessary,
+  income,
+  previous_balance,
+  available,
+  spent,
+  from_savings,
+  debt,
+  balance,
+  expense_total,
+  payment_groups,
+  monthly_trend_points,
+}) {
+  const charts = {
+    polar_area: attachPolarAreaMeta(polar_area),
+    expense_type: buildExpenseTypeChart(necessary, unnecessary),
+    cashflow: buildCashflowChart({
+      income,
+      previous_balance,
+      available,
+      spent,
+      from_savings,
+      debt,
+      balance,
+    }),
+    spending_breakdown: buildSpendingBreakdownChart({
+      expense_total,
+      from_savings,
+      debt,
+      payment_groups,
+    }),
+  };
+
+  if (monthly_trend_points && monthly_trend_points.length) {
+    charts.monthly_trend = buildMonthlyTrendChart(monthly_trend_points);
+  }
+
+  return charts;
 }
 
 /** Savings month net (credited − debited) — applied as from_savings in balance. */
@@ -569,6 +1099,7 @@ async function buildMonthOverview(userId, year, month) {
  * Balance  = Available − From savings − Spent − Debt
  *
  * mode "month" → one month; mode "year" → full calendar year totals
+ * charts: polar_area, expense_type, cashflow, spending_breakdown, monthly_trend
  */
 async function buildDashboard(userId, year, month, mode = "month") {
   if (mode === "year") {
@@ -581,6 +1112,8 @@ async function buildDashboard(userId, year, month, mode = "month") {
   const typeNets = await getExpenseTypeNetsForMonth(userId, year, month);
   const { start, end } = periodRange(year, month, "month");
   const polar_area = await getCategoryPolarArea(userId, start, end);
+  const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
+  const monthly_trend_points = await collectMonthlyTrendPoints(userId, year);
 
   const income = overview.salary;
   const previous_balance = overview.previous_month_balance;
@@ -591,6 +1124,22 @@ async function buildDashboard(userId, year, month, mode = "month") {
   );
   const debt = overview.debt;
   const balance = overview.current_balance;
+
+  const charts = buildChartsBundle({
+    polar_area,
+    necessary: typeNets.necessary,
+    unnecessary: typeNets.unnecessary,
+    income,
+    previous_balance,
+    available,
+    spent,
+    from_savings,
+    debt,
+    balance,
+    expense_total: overview.expense_total,
+    payment_groups,
+    monthly_trend_points,
+  });
 
   return {
     user_id: overview.user_id,
@@ -615,10 +1164,11 @@ async function buildDashboard(userId, year, month, mode = "month") {
     balance,
     necessary: typeNets.necessary,
     unnecessary: typeNets.unnecessary,
-    emis: overview.emis,
-    emi_count: overview.emi_count,
 
-    polar_area,
+    // Charts (prefer data.charts.*). polar_area kept at root for compatibility.
+    // EMI details live under charts.spending_breakdown.emi / slices[key=emi]
+    charts,
+    polar_area: charts.polar_area,
 
     details: {
       previous_balance_manual: overview.previous_month_balance_manual,
@@ -626,13 +1176,34 @@ async function buildDashboard(userId, year, month, mode = "month") {
       savings_amount_debited: overview.savings_amount_debited,
       expense_total: overview.expense_total,
       outgoing_payments_total: overview.outgoing_payments_total,
-      emis: overview.emis,
-      emi_count: overview.emi_count,
       debt_given_net: overview.debt_given_net,
       debt_received_net: overview.debt_received_net,
       total_deductions: overview.total_deductions,
     },
   };
+}
+
+async function collectMonthlyTrendPoints(userId, year) {
+  const points = [];
+  for (let m = 1; m <= 12; m++) {
+    const overview = await buildMonthOverview(userId, year, m);
+    if (!overview) continue;
+    points.push({
+      month: m,
+      year: Number(year),
+      income: overview.salary,
+      spent: roundMoney(
+        overview.expense_total + overview.outgoing_payments_total
+      ),
+      from_savings: overview.from_savings,
+      debt: overview.debt,
+      balance: overview.current_balance,
+      expense_total: overview.expense_total,
+      necessary: 0,
+      unnecessary: 0,
+    });
+  }
+  return points;
 }
 
 async function buildDashboardForYear(userId, year) {
@@ -647,12 +1218,11 @@ async function buildDashboardForYear(userId, year) {
   let savingsDebited = 0;
   let debtGivenNet = 0;
   let debtReceivedNet = 0;
-  let emis = 0;
-  let emi_count = 0;
   let previous_balance = 0;
   let previous_balance_manual = false;
   let balance = 0;
   let date = null;
+  const monthly_trend_points = [];
 
   for (let m = 1; m <= 12; m++) {
     const overview = await buildMonthOverview(userId, year, m);
@@ -664,6 +1234,10 @@ async function buildDashboardForYear(userId, year) {
       previous_balance = overview.previous_month_balance;
       previous_balance_manual = overview.previous_month_balance_manual;
     }
+
+    const monthSpent = roundMoney(
+      overview.expense_total + overview.outgoing_payments_total
+    );
 
     income = roundMoney(income + overview.salary);
     expenseTotal = roundMoney(expenseTotal + overview.expense_total);
@@ -680,8 +1254,19 @@ async function buildDashboardForYear(userId, year) {
     );
     debtGivenNet = roundMoney(debtGivenNet + overview.debt_given_net);
     debtReceivedNet = roundMoney(debtReceivedNet + overview.debt_received_net);
-    emis = roundMoney(emis + (overview.emis || 0));
-    emi_count += overview.emi_count || 0;
+
+    monthly_trend_points.push({
+      month: m,
+      year: Number(year),
+      income: overview.salary,
+      spent: monthSpent,
+      from_savings: overview.from_savings,
+      debt: overview.debt,
+      balance: overview.current_balance,
+      expense_total: overview.expense_total,
+      necessary: typeNets.necessary,
+      unnecessary: typeNets.unnecessary,
+    });
 
     if (m === 12) {
       balance = overview.current_balance;
@@ -695,6 +1280,23 @@ async function buildDashboardForYear(userId, year) {
 
   const { start, end } = periodRange(year, null, "year");
   const polar_area = await getCategoryPolarArea(userId, start, end);
+  const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
+
+  const charts = buildChartsBundle({
+    polar_area,
+    necessary,
+    unnecessary,
+    income,
+    previous_balance,
+    available,
+    spent,
+    from_savings: fromSavings,
+    debt,
+    balance,
+    expense_total: expenseTotal,
+    payment_groups,
+    monthly_trend_points,
+  });
 
   return {
     user_id: Number(userId),
@@ -719,10 +1321,9 @@ async function buildDashboardForYear(userId, year) {
     balance,
     necessary,
     unnecessary,
-    emis,
-    emi_count,
 
-    polar_area,
+    charts,
+    polar_area: charts.polar_area,
 
     details: {
       previous_balance_manual,
@@ -730,8 +1331,6 @@ async function buildDashboardForYear(userId, year) {
       savings_amount_debited: savingsDebited,
       expense_total: expenseTotal,
       outgoing_payments_total: outgoingPayments,
-      emis,
-      emi_count,
       debt_given_net: debtGivenNet,
       debt_received_net: debtReceivedNet,
       total_deductions,
