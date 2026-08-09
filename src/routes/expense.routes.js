@@ -595,6 +595,19 @@ function groupExpensesByCategory(mappedRows) {
   };
 }
 
+function inferPeriodFilter({ filter, date, month, year }) {
+  if (filter) return filter;
+
+  const hasDate = date !== undefined && date !== null && date !== "";
+  const hasMonth = month !== undefined && month !== null && month !== "";
+  const hasYear = year !== undefined && year !== null && year !== "";
+
+  if (hasDate) return "day";
+  if (hasMonth) return "month";
+  if (hasYear) return "year";
+  return null;
+}
+
 function buildExpenseFilterQuery({ user_id, filter, date, month, year }) {
   const conditions = [];
   const params = [];
@@ -604,12 +617,18 @@ function buildExpenseFilterQuery({ user_id, filter, date, month, year }) {
     conditions.push(`user_id = $${params.length}`);
   }
 
-  if (filter) {
-    if (!VALID_FILTERS.has(filter)) {
+  const effectiveFilter = inferPeriodFilter({ filter, date, month, year });
+  if (effectiveFilter) {
+    if (!VALID_FILTERS.has(effectiveFilter)) {
       return { error: "filter must be one of: day, month, year" };
     }
 
-    const range = resolveFilterRange({ filter, date, month, year });
+    const range = resolveFilterRange({
+      filter: effectiveFilter,
+      date,
+      month,
+      year,
+    });
     if (range.error) {
       return { error: range.error };
     }
@@ -779,6 +798,10 @@ router.post("/", async (req, res) => {
 });
 
 // List expenses — 200
+// GET /api/expenses?user_id=1&month=8&year=2026
+// GET /api/expenses?user_id=1&year=2026
+// GET /api/expenses?user_id=1&filter=month&month=8&year=2026
+// GET /api/expenses?user_id=1&filter=year&year=2026
 router.get("/", async (req, res) => {
   try {
     const { user_id, flat, filter, date, month, year } = req.query;

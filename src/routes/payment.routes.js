@@ -10,6 +10,8 @@ const {
   serverError,
 } = require("../utils/response");
 const { parseAmount, formatAmount } = require("../utils/money");
+const { isValidMonth } = require("../masters/month.master");
+const { isValidYear } = require("../masters/year.master");
 const {
   nowTimestamp,
   parseTimestamp,
@@ -18,6 +20,77 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
+
+const VALID_FILTERS = new Set(["day", "month", "year"]);
+
+/**
+ * Resolve inclusive date range for payment list filters.
+ * - filter=day|date     → that day
+ * - filter=month|month  → that month (year defaults to current)
+ * - filter=year|year    → full year
+ */
+function resolvePaymentFilterRange({ filter, date, month, year }) {
+  const currentYear = new Date().getFullYear();
+  const hasDate = date !== undefined && date !== null && date !== "";
+  const hasMonth = month !== undefined && month !== null && month !== "";
+  const hasYear = year !== undefined && year !== null && year !== "";
+
+  let effectiveFilter = filter || null;
+  if (!effectiveFilter) {
+    if (hasDate) effectiveFilter = "day";
+    else if (hasMonth) effectiveFilter = "month";
+    else if (hasYear) effectiveFilter = "year";
+  }
+
+  if (!effectiveFilter) return null;
+
+  if (!VALID_FILTERS.has(effectiveFilter)) {
+    return { error: "filter must be one of: day, month, year" };
+  }
+
+  if (effectiveFilter === "day") {
+    if (!hasDate) {
+      return { error: "date is required for day filter" };
+    }
+    const start = dayStart(date);
+    const end = dayEnd(date);
+    if (!start || !end) {
+      return { error: "date must be a valid date or timestamp" };
+    }
+    return { start, end, mode: "day" };
+  }
+
+  if (effectiveFilter === "month") {
+    if (!hasMonth) {
+      return { error: "month is required for month filter (1-12)" };
+    }
+    if (!isValidMonth(month)) {
+      return { error: "month must be an integer between 1 and 12" };
+    }
+    const selectedYear = hasYear ? Number(year) : currentYear;
+    if (!isValidYear(selectedYear)) {
+      return { error: "year must be a valid year from the years master" };
+    }
+    return {
+      ...monthRangeTimestamps(selectedYear, Number(month)),
+      mode: "month",
+      month: Number(month),
+      year: selectedYear,
+    };
+  }
+
+  // year
+  if (!hasYear) {
+    return { error: "year is required for year filter" };
+  }
+  if (!isValidYear(year)) {
+    return { error: "year must be a valid year from the years master" };
+  }
+  const y = Number(year);
+  const jan = monthRangeTimestamps(y, 1);
+  const dec = monthRangeTimestamps(y, 12);
+  return { start: jan.start, end: dec.end, mode: "year", year: y };
+}
 
 function toAmount(value) {
   return parseAmount(value);
@@ -301,9 +374,13 @@ router.post("/", async (req, res) => {
 
 // List payments
 // GET /api/payments?user_id=2&month=8&year=2026
+// GET /api/payments?user_id=2&year=2026
+// GET /api/payments?user_id=2&filter=month&month=8&year=2026
+// GET /api/payments?user_id=2&filter=year&year=2026
+// GET /api/payments?user_id=2&filter=day&date=2026-08-08
 router.get("/", async (req, res) => {
   try {
-    const { user_id, payment_type_id, date, month, year } = req.query;
+    const { user_id, payment_type_id, filter, date, month, year } = req.query;
     const conditions = [];
     const params = [];
 
@@ -315,33 +392,12 @@ router.get("/", async (req, res) => {
       params.push(payment_type_id);
       conditions.push(`p.payment_type_id = $${params.length}`);
     }
-    if (date) {
-      const start = dayStart(date);
-      const end = dayEnd(date);
-      if (!start || !end) {
-        return badRequest(res, "date must be a valid date or timestamp");
-      }
-      params.push(start);
-      conditions.push(`p.payment_date >= $${params.length}`);
-      params.push(end);
-      conditions.push(`p.payment_date <= $${params.length}`);
-    } else if (month || year) {
-      const now = new Date();
-      const selectedYear = year ? Number(year) : now.getUTCFullYear();
-      const selectedMonth = month ? Number(month) : now.getUTCMonth() + 1;
 
-      if (
-        !Number.isInteger(selectedMonth) ||
-        selectedMonth < 1 ||
-        selectedMonth > 12
-      ) {
-        return badRequest(res, "month must be an integer between 1 and 12");
-      }
-      if (!Number.isInteger(selectedYear) || selectedYear < 2000) {
-        return badRequest(res, "year must be a valid year");
-      }
-
-      const range = monthRangeTimestamps(selectedYear, selectedMonth);
+    const range = resolvePaymentFilterRange({ filter, date, month, year });
+    if (range && range.error) {
+      return badRequest(res, range.error);
+    }
+    if (range) {
       params.push(range.start);
       conditions.push(`p.payment_date >= $${params.length}`);
       params.push(range.end);

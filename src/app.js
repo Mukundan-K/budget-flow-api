@@ -20,6 +20,7 @@ const dashboardRoutes = require("./routes/dashboard.routes");
 const bankAccountRoutes = require("./routes/bankAccount.routes");
 const savingRoutes = require("./routes/saving.routes");
 const debtRoutes = require("./routes/debt.routes");
+const activityRoutes = require("./routes/activity.routes");
 const seedSchema = require("./seed/schema");
 const seedDefaultCategories = require("./seed/defaultCategories");
 const seedPayments = require("./seed/payments");
@@ -50,6 +51,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/bank-accounts", bankAccountRoutes);
 app.use("/api/savings", savingRoutes);
 app.use("/api/debts", debtRoutes);
+app.use("/api/activities", activityRoutes);
 
 // Schema first (users/expenses/monthly_balances), then feature tables
 seedSchema()

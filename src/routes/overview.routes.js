@@ -1471,5 +1471,6 @@ router.patch("/previous-balance", updatePreviousBalance);
 
 module.exports = router;
 module.exports.buildDashboard = buildDashboard;
+module.exports.buildMonthOverview = buildMonthOverview;
 module.exports.parseMonthYear = parseMonthYear;
 module.exports.parseDashboardPeriod = parseDashboardPeriod;
