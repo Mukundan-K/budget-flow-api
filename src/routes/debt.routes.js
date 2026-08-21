@@ -48,7 +48,14 @@ function mapDebt(row) {
   const net_amount = formatAmount(amount - returned_amount);
   return {
     id: row.id,
+    person_id: row.person_id,
     person_name: row.person_name,
+    person: row.person_id
+      ? {
+          id: row.person_id,
+          name: row.person_name,
+        }
+      : undefined,
     amount,
     returned_amount,
     net_amount,
@@ -72,10 +79,12 @@ function mapDebtReturn(row) {
 }
 
 const DEBT_SELECT = `
-  SELECT d.id, d.user_id, d.person_name, d.amount, d.debt_type,
+  SELECT d.id, d.user_id, d.person_id, d.amount, d.debt_type,
          d.debt_date, d.created_at,
+         p.name AS person_name,
          COALESCE(ret.returned_amount, 0) AS returned_amount
   FROM debts d
+  JOIN persons p ON p.id = d.person_id
   LEFT JOIN (
     SELECT debt_id, SUM(amount) AS returned_amount
     FROM debt_returns
@@ -94,10 +103,13 @@ function validatePayload(body, { partial = false } = {}) {
     }
   }
 
-  if (!partial || body.person_name !== undefined || body.name !== undefined) {
-    const name = body.person_name ?? body.name;
-    if (!name || String(name).trim() === "") {
-      errors.push("person_name is required");
+  if (!partial || body.person_id !== undefined) {
+    if (
+      body.person_id === undefined ||
+      body.person_id === null ||
+      body.person_id === ""
+    ) {
+      errors.push("person_id is required");
     }
   }
 
@@ -123,6 +135,20 @@ function validatePayload(body, { partial = false } = {}) {
   }
 
   return errors;
+}
+
+async function assertPersonForUser(person_id, user_id) {
+  const result = await db.query(
+    `SELECT id, name, user_id FROM persons WHERE id = $1`,
+    [person_id]
+  );
+  if (result.rows.length === 0) {
+    return { error: "person_id is invalid" };
+  }
+  if (String(result.rows[0].user_id) !== String(user_id)) {
+    return { error: "person_id does not belong to this user" };
+  }
+  return { person: result.rows[0] };
 }
 
 // Details / summary — before /:id
@@ -228,16 +254,21 @@ router.post("/", async (req, res) => {
     }
 
     const amount = formatAmount(req.body.amount);
-    const person_name = String(req.body.person_name ?? req.body.name).trim();
+    const person_id = req.body.person_id;
     const debt_type = parseDebtType(req.body.debt_type ?? req.body.type);
     const user_id = req.body.user_id;
     const debt_date = parseTimestamp(req.body.date) || nowTimestamp();
 
+    const personCheck = await assertPersonForUser(person_id, user_id);
+    if (personCheck.error) {
+      return badRequest(res, personCheck.error);
+    }
+
     const inserted = await db.query(
-      `INSERT INTO debts (user_id, person_name, amount, debt_type, debt_date)
+      `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id`,
-      [user_id, person_name, amount, debt_type, debt_date]
+      [user_id, person_id, amount, debt_type, debt_date]
     );
 
     const result = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
@@ -254,7 +285,7 @@ router.post("/", async (req, res) => {
 // List debts
 router.get("/", async (req, res) => {
   try {
-    const { user_id, debt_type, type, date, month, year } = req.query;
+    const { user_id, debt_type, type, date, month, year, person_id } = req.query;
     if (!user_id) {
       return badRequest(res, "user_id is required");
     }
@@ -269,6 +300,11 @@ router.get("/", async (req, res) => {
       }
       params.push(parsedType);
       conditions.push(`d.debt_type = $${params.length}`);
+    }
+
+    if (person_id !== undefined && person_id !== null && person_id !== "") {
+      params.push(person_id);
+      conditions.push(`d.person_id = $${params.length}`);
     }
 
     if (date) {
@@ -490,10 +526,8 @@ async function updateDebt(req, res, { partial = false } = {}) {
       req.body.amount !== undefined
         ? formatAmount(req.body.amount)
         : formatAmount(current.amount);
-    const person_name =
-      req.body.person_name !== undefined || req.body.name !== undefined
-        ? String(req.body.person_name ?? req.body.name).trim()
-        : current.person_name;
+    const person_id =
+      req.body.person_id !== undefined ? req.body.person_id : current.person_id;
     const debt_type =
       req.body.debt_type !== undefined || req.body.type !== undefined
         ? parseDebtType(req.body.debt_type ?? req.body.type)
@@ -506,6 +540,11 @@ async function updateDebt(req, res, { partial = false } = {}) {
 
     if (debt_type === null) {
       return badRequest(res, "debt_type must be 'given' or 'received'");
+    }
+
+    const personCheck = await assertPersonForUser(person_id, user_id);
+    if (personCheck.error) {
+      return badRequest(res, personCheck.error);
     }
 
     const returned = await db.query(
@@ -524,12 +563,12 @@ async function updateDebt(req, res, { partial = false } = {}) {
     await db.query(
       `UPDATE debts
        SET user_id = $1,
-           person_name = $2,
+           person_id = $2,
            amount = $3,
            debt_type = $4,
            debt_date = $5
        WHERE id = $6`,
-      [user_id, person_name, amount, debt_type, debt_date, req.params.id]
+      [user_id, person_id, amount, debt_type, debt_date, req.params.id]
     );
 
     const result = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [

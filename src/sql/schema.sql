@@ -119,11 +119,20 @@ CREATE TABLE IF NOT EXISTS savings_transactions (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- ========== PERSONS (debt counterparty master) ==========
+CREATE TABLE IF NOT EXISTS persons (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(200) NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE (user_id, name)
+);
+
 -- ========== DEBTS ==========
 CREATE TABLE IF NOT EXISTS debts (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  person_name VARCHAR(200) NOT NULL,
+  person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
   amount NUMERIC(18, 8) NOT NULL CHECK (amount > 0),
   debt_type VARCHAR(20) NOT NULL CHECK (debt_type IN ('given', 'received')),
   debt_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),

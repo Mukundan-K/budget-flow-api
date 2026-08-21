@@ -996,6 +996,9 @@ async function buildMonthOverview(userId, year, month) {
   }
 
   while (compareYearMonth(cursor, target) <= 0) {
+    // Default previous balance = previous month's Remaining (current_balance).
+    // Manual edit in monthly_balances overrides that for this month only.
+    const calculatedPreviousMonthBalance = previousMonthBalance;
     const storedPrevious = await getStoredPreviousBalance(
       userId,
       cursor.year,
@@ -1033,11 +1036,12 @@ async function buildMonthOverview(userId, year, month) {
       cursor.month
     );
     const debt = debtInfo.debt;
-    // Balance = (Income + Prev.) − (from_savings + expenses + debt + outgoing)
+    // Remaining = (Incoming + Prev.) − Total Spent − Savings
+    // Total Spent = expenses + outgoing payments
+    // Debt is reported separately and does not affect Remaining.
+    const totalSpent = roundMoney(expenseTotal + outgoingPayments);
     const totalAmountToSpend = roundMoney(salary + previousMonthBalance);
-    const totalDeductions = roundMoney(
-      fromSavings + expenseTotal + debt + outgoingPayments
-    );
+    const totalDeductions = roundMoney(totalSpent + fromSavings);
     const currentBalance = roundMoney(totalAmountToSpend - totalDeductions);
 
     if (cursor.year === target.year && cursor.month === target.month) {
@@ -1060,7 +1064,10 @@ async function buildMonthOverview(userId, year, month) {
           ? formatTimestamp(latestSalary.payment_date)
           : null,
         salary,
+        // Effective value used in balance math (manual override or calculated)
         previous_month_balance: previousMonthBalance,
+        // Auto value = previous month Remaining (before any edit)
+        previous_month_balance_calculated: calculatedPreviousMonthBalance,
         previous_month_balance_manual: storedPrevious !== null,
         from_savings: fromSavings,
         savings_credited: fromSavings,
@@ -1075,12 +1082,14 @@ async function buildMonthOverview(userId, year, month) {
         debt_received_total: debtInfo.received_total,
         debt_received_returned: debtInfo.received_returned,
         total_amount_to_spend: totalAmountToSpend,
+        total_spent: totalSpent,
         total_deductions: totalDeductions,
-        total_expenses: roundMoney(expenseTotal + outgoingPayments),
+        total_expenses: totalSpent,
         expense_total: expenseTotal,
         outgoing_payments_total: outgoingPayments,
         emis: emiStats.emis,
         emi_count: emiStats.emi_count,
+        // Remaining — becomes next month's calculated previous balance
         current_balance: currentBalance,
       };
     }
@@ -1094,9 +1103,10 @@ async function buildMonthOverview(userId, year, month) {
 
 /**
  * Dashboard card payload — same month math as overview, clear labels for UI.
- * Available = Income + Prev. balance
- * Spent    = expenses (net) + outgoing payments (net)
- * Balance  = Available − From savings − Spent − Debt
+ * Available = Incoming + Prev. balance
+ * Total Spent = expenses (net) + outgoing payments (net)
+ * Remaining  = Available − Total Spent − Savings
+ *            = (Incoming + Prev.) − Spent − Savings
  *
  * mode "month" → one month; mode "year" → full calendar year totals
  * charts: polar_area, expense_type, cashflow, spending_breakdown, monthly_trend
@@ -1172,6 +1182,7 @@ async function buildDashboard(userId, year, month, mode = "month") {
 
     details: {
       previous_balance_manual: overview.previous_month_balance_manual,
+      previous_balance_calculated: overview.previous_month_balance_calculated,
       savings_amount_saved: overview.savings_amount_saved,
       savings_amount_debited: overview.savings_amount_debited,
       expense_total: overview.expense_total,
@@ -1276,7 +1287,8 @@ async function buildDashboardForYear(userId, year) {
 
   const available = roundMoney(income + previous_balance);
   const spent = roundMoney(expenseTotal + outgoingPayments);
-  const total_deductions = roundMoney(fromSavings + spent + debt);
+  // Remaining = Available − Spent − Savings (debt excluded)
+  const total_deductions = roundMoney(fromSavings + spent);
 
   const { start, end } = periodRange(year, null, "year");
   const polar_area = await getCategoryPolarArea(userId, start, end);

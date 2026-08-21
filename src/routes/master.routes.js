@@ -7,16 +7,31 @@ const { getYears } = require("../masters/year.master");
 
 /**
  * Read-only masters (months / years).
- * Payment types CRUD lives at /api/payment-types.
+ * Payment types CRUD: /api/payment-types
+ * Persons CRUD: /api/persons
  */
 
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
   try {
+    const { user_id } = req.query;
+
     const paymentTypes = await db.query(
       `SELECT id, name, is_income, created_at
        FROM payment_types
        ORDER BY name ASC`
     );
+
+    let persons = [];
+    if (user_id) {
+      const personsResult = await db.query(
+        `SELECT id, user_id, name, created_at
+         FROM persons
+         WHERE user_id = $1
+         ORDER BY name ASC`,
+        [user_id]
+      );
+      persons = personsResult.rows;
+    }
 
     return success(
       res,
@@ -29,6 +44,7 @@ router.get("/", async (_req, res) => {
           is_income: Boolean(row.is_income),
           created_at: row.created_at,
         })),
+        persons,
       },
       "Masters fetched successfully"
     );

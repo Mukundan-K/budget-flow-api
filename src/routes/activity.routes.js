@@ -341,6 +341,9 @@ function buildMonthBuckets(year, monthFilter) {
     name: m.name,
     short: m.short,
     year,
+    previous_month_balance: 0,
+    previous_month_balance_calculated: 0,
+    previous_balance_manual: false,
     payments: {
       categories: new Map(),
       incoming_total: 0,
@@ -364,17 +367,28 @@ function buildMonthBuckets(year, monthFilter) {
 
 /**
  * Remaining balance for each month (same as overview current_balance):
- * (Income + Prev. balance) − (from_savings + expenses + debt + outgoing)
+ * (Incoming + Prev. balance) − Total Spent − Savings
+ * Total Spent = expenses + outgoing payments
  */
-async function getRemainingBalancesForMonths(userId, year, monthIds) {
+async function getOverviewBalancesForMonths(userId, year, monthIds) {
   const byMonth = new Map();
   await Promise.all(
     monthIds.map(async (monthId) => {
       const overview = await buildMonthOverview(userId, year, monthId);
-      byMonth.set(
-        monthId,
-        overview ? roundMoney(overview.current_balance) : 0
-      );
+      byMonth.set(monthId, {
+        // Remaining for this month (feeds next month's calculated previous)
+        bank_balance: overview ? roundMoney(overview.current_balance) : 0,
+        // Effective previous (manual edit if set, else prev month Remaining)
+        previous_month_balance: overview
+          ? roundMoney(overview.previous_month_balance)
+          : 0,
+        previous_month_balance_calculated: overview
+          ? roundMoney(overview.previous_month_balance_calculated)
+          : 0,
+        previous_balance_manual: overview
+          ? Boolean(overview.previous_month_balance_manual)
+          : false,
+      });
     })
   );
   return byMonth;
@@ -529,8 +543,8 @@ router.get("/", async (req, res) => {
     const buckets = buildMonthBuckets(period.year, period.month);
     const byMonth = new Map(buckets.map((b) => [b.id, b]));
 
-    const [bankByMonth, savingsByMonth] = await Promise.all([
-      getRemainingBalancesForMonths(
+    const [overviewByMonth, savingsByMonth] = await Promise.all([
+      getOverviewBalancesForMonths(
         user_id,
         period.year,
         buckets.map((b) => b.id)
@@ -566,7 +580,17 @@ router.get("/", async (req, res) => {
     });
 
     buckets.forEach((bucket) => {
-      bucket.payments.bank_balance = bankByMonth.get(bucket.id) ?? 0;
+      const overviewBalances = overviewByMonth.get(bucket.id) || {
+        bank_balance: 0,
+        previous_month_balance: 0,
+        previous_month_balance_calculated: 0,
+        previous_balance_manual: false,
+      };
+      bucket.previous_month_balance = overviewBalances.previous_month_balance;
+      bucket.previous_month_balance_calculated =
+        overviewBalances.previous_month_balance_calculated;
+      bucket.previous_balance_manual = overviewBalances.previous_balance_manual;
+      bucket.payments.bank_balance = overviewBalances.bank_balance;
       bucket.payments.savings_balance = savingsByMonth.get(bucket.id) ?? 0;
     });
 
@@ -606,7 +630,14 @@ router.get("/", async (req, res) => {
     });
 
     const months = buckets.map((bucket) => ({
-      ...bucket,
+      id: bucket.id,
+      name: bucket.name,
+      short: bucket.short,
+      year: bucket.year,
+      previous_month_balance: bucket.previous_month_balance,
+      previous_month_balance_calculated:
+        bucket.previous_month_balance_calculated,
+      previous_balance_manual: bucket.previous_balance_manual,
       payments: {
         categories: finalizeCategoryGroups(bucket.payments.categories),
         incoming_total: bucket.payments.incoming_total,
