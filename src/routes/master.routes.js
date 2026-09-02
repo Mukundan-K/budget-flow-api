@@ -16,7 +16,7 @@ router.get("/", async (req, res) => {
     const { user_id } = req.query;
 
     const paymentTypes = await db.query(
-      `SELECT id, name, is_income, created_at
+      `SELECT id, name, flow, is_income, created_at
        FROM payment_types
        ORDER BY name ASC`
     );
@@ -41,6 +41,12 @@ router.get("/", async (req, res) => {
         payment_types: paymentTypes.rows.map((row) => ({
           id: row.id,
           name: row.name,
+          flow:
+            row.flow === "incoming" || row.flow === "outgoing"
+              ? row.flow
+              : Boolean(row.is_income)
+                ? "incoming"
+                : "outgoing",
           is_income: Boolean(row.is_income),
           created_at: row.created_at,
         })),

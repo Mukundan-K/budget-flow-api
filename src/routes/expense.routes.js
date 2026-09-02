@@ -18,6 +18,7 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
+const { calculateExpenseAmounts } = require("../services/financial");
 
 const VALID_FILTERS = new Set(["day", "month", "year"]);
 const AMOUNT_EPSILON = 1e-8;
@@ -170,8 +171,8 @@ function resolveCategorySplits(body, { partial = false, fallbackTotal } = {}) {
         allHaveAmount = false;
       } else {
         const amt = parseAmount(item.amount);
-        if (amt === null || amt <= 0) {
-          errors.push(`categories[${i}].amount must be a positive number`);
+        if (amt === null || amt < 0) {
+          errors.push(`categories[${i}].amount must be a non-negative number (0 allowed)`);
           rawAmounts.push(null);
         } else {
           rawAmounts.push(amt);
@@ -222,7 +223,8 @@ function resolveCategorySplits(body, { partial = false, fallbackTotal } = {}) {
         "provide amount on every categories[] item, or omit all amounts for equal split"
       );
     } else {
-      if (totalAmount === null || totalAmount <= 0) {
+      // Equal split — amount may be 0 (placeholder; returns/advances added first)
+      if (totalAmount === null || totalAmount < 0) {
         errors.push("amount is required to split equally across categories");
       } else {
         amounts = splitEqually(totalAmount, names.length);
@@ -254,14 +256,14 @@ function resolveCategorySplits(body, { partial = false, fallbackTotal } = {}) {
   if (!category) {
     return { errors: ["category is required"] };
   }
-  if (totalAmount === null || totalAmount <= 0) {
+  if (totalAmount === null || totalAmount < 0) {
     if (!partial) {
       return { errors: ["amount is required"] };
     }
   }
 
   const amount =
-    totalAmount !== null && totalAmount > 0
+    totalAmount !== null && totalAmount >= 0
       ? formatAmount(totalAmount)
       : undefined;
 
@@ -294,41 +296,29 @@ function mapExpense(row, splits = null, returnsByCategory = {}) {
           },
         ]);
 
-  const normalizedSplits = categorySplits.map((s) => {
-    const amount = toAmount(s.amount);
-    const key = String(s.category);
-    const returned_amount = toAmount(
-      returnsByCategory[key] ?? returnsByCategory[key.toLowerCase()] ?? 0
-    );
-    return {
+  const amounts = calculateExpenseAmounts({
+    amount: row.amount,
+    headerReturnedAmount: row.returned_amount || 0,
+    splits: categorySplits.map((s) => ({
       category: s.category,
-      amount,
+      amount: s.amount,
       expense_type: parseExpenseType(s.expense_type) ?? fallbackType,
-      returned_amount,
-      net_amount: roundMoney(amount - returned_amount),
-    };
+    })),
+    returnsByCategory,
+    fallbackExpenseType: fallbackType,
   });
-
-  const returned_amount = roundMoney(
-    addAmounts(...normalizedSplits.map((s) => s.returned_amount))
-  );
-  const amount = toAmount(row.amount);
-  const net_amount = roundMoney(amount - returned_amount);
 
   return {
     id: row.id,
-    amount,
-    returned_amount,
-    net_amount,
-    my_contribution: net_amount,
-    expense_type: normalizedSplits[0]?.expense_type ?? fallbackType,
+    amount: amounts.amount,
+    returned_amount: amounts.returned_amount,
+    net_amount: amounts.net_amount,
+    my_contribution: amounts.my_contribution,
+    expense_type: amounts.categories[0]?.expense_type ?? fallbackType,
     expense_date: formatTimestamp(row.expense_date),
-    category: normalizedSplits[0]?.category || row.category,
-    categories: normalizedSplits.map((s) => ({
-      ...s,
-      my_contribution: s.net_amount,
-    })),
-    is_split: normalizedSplits.length > 1,
+    category: amounts.categories[0]?.category || row.category,
+    categories: amounts.categories,
+    is_split: amounts.is_split,
     user_id: row.user_id,
     created_at: row.created_at,
   };
@@ -505,8 +495,8 @@ function validateExpensePayload(body, { partial = false } = {}) {
   if (!partial || amount !== undefined) {
     if (amount === undefined || amount === null || amount === "") {
       errors.push("amount is required");
-    } else if (Number.isNaN(Number(amount)) || Number(amount) <= 0) {
-      errors.push("amount must be a positive number");
+    } else if (Number.isNaN(Number(amount)) || Number(amount) < 0) {
+      errors.push("amount must be a non-negative number (0 allowed)");
     }
   }
 
@@ -648,7 +638,6 @@ function buildExpenseFilterQuery({ user_id, filter, date, month, year }) {
 
 function buildPieChartByCategory(mappedRows) {
   const byCategory = {};
-  let grandTotal = 0;
 
   mappedRows.forEach((exp) => {
     const splits =
@@ -678,7 +667,6 @@ function buildPieChartByCategory(mappedRows) {
 
       const group = byCategory[categoryName];
       group.total = roundMoney(group.total + amount);
-      grandTotal = roundMoney(grandTotal + amount);
 
       if (isNecessary) {
         group.necessary_total = roundMoney(group.necessary_total + amount);
@@ -689,16 +677,20 @@ function buildPieChartByCategory(mappedRows) {
   });
 
   const slices = Object.values(byCategory)
-    .map((group) => ({
-      ...group,
-      percentage:
-        grandTotal > 0 ? roundMoney((group.total / grandTotal) * 100) : 0,
-    }))
-    .sort((a, b) => b.total - a.total);
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 10);
+
+  const grandTotal = roundMoney(
+    slices.reduce((sum, group) => sum + group.total, 0)
+  );
 
   return {
     grand_total: grandTotal,
-    slices,
+    slices: slices.map((group) => ({
+      ...group,
+      percentage:
+        grandTotal > 0 ? roundMoney((group.total / grandTotal) * 100) : 0,
+    })),
   };
 }
 
@@ -940,13 +932,7 @@ router.post("/:id/returns", async (req, res) => {
       return badRequest(res, "category is not part of this expense");
     }
 
-    const remaining = roundMoney(split.net_amount);
-    if (amount > remaining) {
-      return badRequest(
-        res,
-        `return amount exceeds remaining category amount (available: ${remaining})`
-      );
-    }
+    // Returns may exceed the category/paid amount (over-refund); net_amount can be negative.
 
     const user_id = req.body.user_id ?? mapped.user_id;
     if (String(user_id) !== String(mapped.user_id)) {

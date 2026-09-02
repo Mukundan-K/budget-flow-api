@@ -17,6 +17,7 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
+const { calculateSavingsNet, calculateSavingsAmounts } = require("../services/financial");
 
 function parseTransactionType(value) {
   if (value === undefined || value === null || value === "") return undefined;
@@ -120,7 +121,7 @@ async function getBankBalance(clientOrDb, bankAccountId, excludeTxnId = null) {
   return {
     credited,
     debited,
-    balance: formatAmount(credited - debited),
+    balance: calculateSavingsNet(credited, debited),
   };
 }
 
@@ -222,24 +223,26 @@ router.get("/details", async (req, res) => {
     );
     const lifetimeById = {};
     lifetime.rows.forEach((row) => {
-      lifetimeById[row.id] = formatAmount(
-        formatAmount(row.credited) - formatAmount(row.debited)
-      );
+      lifetimeById[row.id] = calculateSavingsNet(row.credited, row.debited);
     });
 
     const bankAccounts = banks.rows.map((row) => {
-      const amount_saved = formatAmount(row.amount_saved);
-      const amount_debited = formatAmount(row.amount_debited);
-      const month_net = formatAmount(amount_saved - amount_debited);
+      const amounts = calculateSavingsAmounts({
+        amount_saved: row.amount_saved,
+        amount_debited: row.amount_debited,
+      });
       return {
         id: row.id,
         name: row.name,
         is_active: Boolean(row.is_active),
-        amount_saved,
-        amount_debited,
+        amount_saved: amounts.amount_saved,
+        amount_debited: amounts.amount_debited,
+        saved: amounts.saved,
+        debited: amounts.debited,
+        net: amounts.net,
         // Bank balance for this view = month net (saved - debited), not debited-only
-        total_amount: month_net,
-        month_net,
+        total_amount: amounts.month_net,
+        month_net: amounts.month_net,
         available_balance: lifetimeById[row.id] ?? 0,
       };
     });
@@ -250,8 +253,9 @@ router.get("/details", async (req, res) => {
     const overall_amount_debited = formatAmount(
       addAmounts(...bankAccounts.map((b) => b.amount_debited))
     );
-    const overall_month_net = formatAmount(
-      overall_amount_saved - overall_amount_debited
+    const overall_month_net = calculateSavingsNet(
+      overall_amount_saved,
+      overall_amount_debited
     );
     const overall_available = formatAmount(
       addAmounts(...bankAccounts.map((b) => b.available_balance))

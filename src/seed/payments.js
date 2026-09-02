@@ -10,9 +10,55 @@ async function seedPayments() {
       CREATE TABLE IF NOT EXISTS payment_types (
         id SERIAL PRIMARY KEY,
         name VARCHAR(100) NOT NULL UNIQUE,
+        flow VARCHAR(20) NOT NULL DEFAULT 'outgoing'
+          CHECK (flow IN ('incoming', 'outgoing')),
         is_income BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       )
+    `);
+
+    // Older DBs: add is_income if missing (existing rows → false)
+    await db.query(`
+      ALTER TABLE payment_types
+      ADD COLUMN IF NOT EXISTS is_income BOOLEAN NOT NULL DEFAULT FALSE
+    `);
+    await db.query(`
+      UPDATE payment_types
+      SET is_income = FALSE
+      WHERE is_income IS NULL
+    `);
+
+    // Older DBs: add flow as independent column (backfill from is_income once)
+    await db.query(`
+      ALTER TABLE payment_types
+      ADD COLUMN IF NOT EXISTS flow VARCHAR(20)
+    `);
+    await db.query(`
+      UPDATE payment_types
+      SET flow = CASE WHEN is_income = TRUE THEN 'incoming' ELSE 'outgoing' END
+      WHERE flow IS NULL OR flow = ''
+    `);
+    await db.query(`
+      ALTER TABLE payment_types
+      ALTER COLUMN flow SET DEFAULT 'outgoing'
+    `);
+    await db.query(`
+      ALTER TABLE payment_types
+      ALTER COLUMN flow SET NOT NULL
+    `);
+    // Ensure flow values are constrained (idempotent)
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'payment_types_flow_check'
+        ) THEN
+          ALTER TABLE payment_types
+          ADD CONSTRAINT payment_types_flow_check
+          CHECK (flow IN ('incoming', 'outgoing'));
+        END IF;
+      END $$;
     `);
 
     await db.query(`
@@ -83,10 +129,20 @@ async function seedPayments() {
     await migrateColumnToNumeric("payments", "amount");
 
     await db.query(
-      `INSERT INTO payment_types (name, is_income)
-       VALUES ($1, $2), ($3, $4), ($5, $6)
+      `INSERT INTO payment_types (name, flow, is_income)
+       VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)
        ON CONFLICT (name) DO NOTHING`,
-      ["Salary", true, "Rent", false, "EMI", false]
+      [
+        "Salary",
+        "incoming",
+        true,
+        "Rent",
+        "outgoing",
+        false,
+        "EMI",
+        "outgoing",
+        false,
+      ]
     );
 
     await db.query(`DROP TABLE IF EXISTS salaries CASCADE`);

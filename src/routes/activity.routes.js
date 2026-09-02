@@ -16,6 +16,13 @@ const {
   getZonedCalendarParts,
 } = require("../utils/datetime");
 const { buildMonthOverview } = require("./overview.routes");
+const {
+  calculatePaymentAmounts,
+  calculateExpenseAmounts,
+  enrichEmiProduct,
+  buildActivityMonthFinancials,
+  calculateSavingsNet,
+} = require("../services/financial");
 
 function toAmount(value) {
   return formatAmount(value);
@@ -50,26 +57,25 @@ function calendarMonth(value) {
 
 function mapEmiProduct(row) {
   if (!row || !row.emi_product_id) return null;
-  return {
+  return enrichEmiProduct({
     id: row.emi_product_id,
     product_name: row.emi_product_name,
     start_date: formatTimestamp(row.emi_start_from),
     already_paid: row.already_paid != null ? Number(row.already_paid) : 0,
     number_of_emis:
       row.number_of_emis != null ? Number(row.number_of_emis) : null,
-  };
+  });
 }
 
 function mapPayment(row) {
-  const amount = formatAmount(row.amount);
-  const returned_amount = formatAmount(row.returned_amount || 0);
-  const net_amount = formatAmount(amount - returned_amount);
+  const amounts = calculatePaymentAmounts({
+    amount: row.amount,
+    returned_amount: row.returned_amount || 0,
+  });
   return {
     id: row.id,
-    amount,
-    returned_amount,
-    net_amount,
-    my_contribution: net_amount,
+    ...amounts,
+    is_income: Boolean(row.payment_type_is_income),
     date: formatTimestamp(row.payment_date),
     user_id: row.user_id,
     payment_type_id: row.payment_type_id,
@@ -77,6 +83,13 @@ function mapPayment(row) {
       ? {
           id: row.payment_type_id,
           name: row.payment_type_name,
+          flow:
+            row.payment_type_flow === "incoming" ||
+            row.payment_type_flow === "outgoing"
+              ? row.payment_type_flow
+              : Boolean(row.payment_type_is_income)
+                ? "incoming"
+                : "outgoing",
           is_income: Boolean(row.payment_type_is_income),
         }
       : undefined,
@@ -99,40 +112,30 @@ function mapExpense(row, splits = null, returnsByCategory = {}) {
       },
     ];
 
-  const normalizedSplits = categorySplits.map((s) => {
-    const amount = toAmount(s.amount);
-    const key = String(s.category);
-    const returned_amount = toAmount(
-      returnsByCategory[key] ?? returnsByCategory[key.toLowerCase()] ?? 0
-    );
-    return {
+  const amounts = calculateExpenseAmounts({
+    amount: row.amount,
+    headerReturnedAmount: row.returned_amount || 0,
+    splits: categorySplits.map((s) => ({
       category: s.category,
-      amount,
+      amount: s.amount,
       expense_type: parseExpenseType(s.expense_type) ?? fallbackType,
-      returned_amount,
-      net_amount: roundMoney(amount - returned_amount),
-      my_contribution: roundMoney(amount - returned_amount),
-    };
+    })),
+    returnsByCategory,
+    fallbackExpenseType: fallbackType,
   });
-
-  const returned_amount = roundMoney(
-    addAmounts(...normalizedSplits.map((s) => s.returned_amount))
-  );
-  const amount = toAmount(row.amount);
-  const net_amount = roundMoney(amount - returned_amount);
 
   return {
     id: row.id,
-    amount,
-    returned_amount,
-    net_amount,
-    my_contribution: net_amount,
-    expense_type: normalizedSplits[0]?.expense_type ?? fallbackType,
+    amount: amounts.amount,
+    returned_amount: amounts.returned_amount,
+    net_amount: amounts.net_amount,
+    my_contribution: amounts.my_contribution,
+    expense_type: amounts.categories[0]?.expense_type ?? fallbackType,
     expense_date: formatTimestamp(row.expense_date),
     date: formatTimestamp(row.expense_date),
-    category: normalizedSplits[0]?.category || row.category,
-    categories: normalizedSplits,
-    is_split: normalizedSplits.length > 1,
+    category: amounts.categories[0]?.category || row.category,
+    categories: amounts.categories,
+    is_split: amounts.is_split,
     user_id: row.user_id,
     created_at: formatTimestamp(row.created_at) || row.created_at,
   };
@@ -314,7 +317,8 @@ function addPaymentToCategoryGroups(groupsMap, payment) {
 const PAYMENT_SELECT = `
   SELECT p.id, p.amount, p.payment_date, p.user_id, p.payment_type_id,
          p.emi_product_id, p.created_at,
-         pt.name AS payment_type_name, pt.is_income AS payment_type_is_income,
+         pt.name AS payment_type_name, pt.flow AS payment_type_flow,
+         pt.is_income AS payment_type_is_income,
          ep.product_name AS emi_product_name,
          ep.emi_start_from,
          ep.already_paid,
@@ -347,6 +351,8 @@ function buildMonthBuckets(year, monthFilter) {
     payments: {
       categories: new Map(),
       incoming_total: 0,
+      earned_total: 0,
+      not_earned_total: 0,
       outgoing_total: 0,
       total: 0,
       count: 0,
@@ -367,8 +373,9 @@ function buildMonthBuckets(year, monthFilter) {
 
 /**
  * Remaining balance for each month (same as overview current_balance):
- * (Incoming + Prev. balance) − Total Spent − Savings
+ * (Incoming + Prev. balance) − Total Spent − Savings − Debt
  * Total Spent = expenses + outgoing payments
+ * Debt = month debt_net (given_net − received_net)
  */
 async function getOverviewBalancesForMonths(userId, year, monthIds) {
   const byMonth = new Map();
@@ -503,7 +510,8 @@ function resolveActivityPeriod({ filter, month, year }) {
  * GET /api/activities?user_id=1&filter=month&month=8&year=2026
  *
  * Returns months list; each month has payments + expenses.
- * Payment totals split into incoming (is_income) and outgoing.
+ * Payment totals split into incoming (flow) / outgoing (flow),
+ * and incoming further into earned (is_income) / not_earned.
  */
 router.get("/", async (req, res) => {
   try {
@@ -564,10 +572,24 @@ router.get("/", async (req, res) => {
       addPaymentToCategoryGroups(bucket.payments.categories, payment);
 
       const net = payment.net_amount || 0;
-      if (payment.payment_type?.is_income) {
+      const flow = payment.payment_type?.flow;
+      const isIncoming =
+        flow === "incoming" ||
+        (flow !== "outgoing" && Boolean(payment.payment_type?.is_income));
+
+      if (isIncoming) {
         bucket.payments.incoming_total = roundMoney(
           bucket.payments.incoming_total + net
         );
+        if (payment.payment_type?.is_income) {
+          bucket.payments.earned_total = roundMoney(
+            bucket.payments.earned_total + net
+          );
+        } else {
+          bucket.payments.not_earned_total = roundMoney(
+            bucket.payments.not_earned_total + net
+          );
+        }
       } else {
         bucket.payments.outgoing_total = roundMoney(
           bucket.payments.outgoing_total + net
@@ -629,33 +651,61 @@ router.get("/", async (req, res) => {
       bucket.expenses.count = bucket.expenses._expenseIds.size;
     });
 
-    const months = buckets.map((bucket) => ({
-      id: bucket.id,
-      name: bucket.name,
-      short: bucket.short,
-      year: bucket.year,
-      previous_month_balance: bucket.previous_month_balance,
-      previous_month_balance_calculated:
-        bucket.previous_month_balance_calculated,
-      previous_balance_manual: bucket.previous_balance_manual,
-      payments: {
-        categories: finalizeCategoryGroups(bucket.payments.categories),
-        incoming_total: bucket.payments.incoming_total,
+    const months = buckets.map((bucket) => {
+      const financial = buildActivityMonthFinancials({
+        earned_total: bucket.payments.earned_total,
+        not_earned_total: bucket.payments.not_earned_total,
         outgoing_total: bucket.payments.outgoing_total,
-        total: bucket.payments.total,
-        count: bucket.payments.count,
-        bank_balance: bucket.payments.bank_balance,
-        savings_balance: bucket.payments.savings_balance,
-      },
-      expenses: {
-        necessary: finalizeCategoryGroups(bucket.expenses.necessary),
-        unnecessary: finalizeCategoryGroups(bucket.expenses.unnecessary),
-        necessary_total: bucket.expenses.necessary_total,
-        unnecessary_total: bucket.expenses.unnecessary_total,
-        total: bucket.expenses.total,
-        count: bucket.expenses.count,
-      },
-    }));
+        expense_total: bucket.expenses.total,
+        overviewBalances: {
+          bank_balance: bucket.payments.bank_balance,
+          savings_balance: bucket.payments.savings_balance,
+          previous_month_balance: bucket.previous_month_balance,
+          previous_month_balance_calculated:
+            bucket.previous_month_balance_calculated,
+          previous_balance_manual: bucket.previous_balance_manual,
+        },
+      });
+
+      return {
+        id: bucket.id,
+        name: bucket.name,
+        short: bucket.short,
+        year: bucket.year,
+        previous_month_balance: financial.previous_month_balance,
+        previous_month_balance_calculated:
+          financial.previous_month_balance_calculated,
+        previous_balance_manual: financial.previous_balance_manual,
+        // Canonical month financials (additive)
+        incoming: financial.incoming,
+        earned: financial.earned,
+        not_earned: financial.not_earned,
+        available: financial.available,
+        outgoing: financial.outgoing,
+        spent: financial.spent,
+        bank_balance: financial.bank_balance,
+        savings_balance: financial.savings_balance,
+        payments: {
+          categories: finalizeCategoryGroups(bucket.payments.categories),
+          incoming_total: bucket.payments.incoming_total,
+          earned_total: bucket.payments.earned_total,
+          not_earned_total: bucket.payments.not_earned_total,
+          outgoing_total: bucket.payments.outgoing_total,
+          total: bucket.payments.total,
+          count: bucket.payments.count,
+          bank_balance: financial.bank_balance,
+          savings_balance: financial.savings_balance,
+        },
+        expenses: {
+          necessary: finalizeCategoryGroups(bucket.expenses.necessary),
+          unnecessary: finalizeCategoryGroups(bucket.expenses.unnecessary),
+          necessary_total: bucket.expenses.necessary_total,
+          unnecessary_total: bucket.expenses.unnecessary_total,
+          total: bucket.expenses.total,
+          count: bucket.expenses.count,
+        },
+      };
+    });
 
     return success(
       res,

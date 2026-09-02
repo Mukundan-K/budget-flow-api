@@ -20,6 +20,10 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
+const {
+  calculatePaymentAmounts,
+  enrichEmiProduct,
+} = require("../services/financial");
 
 const VALID_FILTERS = new Set(["day", "month", "year"]);
 
@@ -102,25 +106,24 @@ function isEmiType(typeRow) {
 
 function mapEmiProduct(row) {
   if (!row || !row.emi_product_id) return null;
-  return {
+  return enrichEmiProduct({
     id: row.emi_product_id,
     product_name: row.emi_product_name,
     start_date: formatTimestamp(row.emi_start_from),
     already_paid: row.already_paid != null ? Number(row.already_paid) : 0,
-    number_of_emis: row.number_of_emis != null ? Number(row.number_of_emis) : null,
-  };
+    number_of_emis:
+      row.number_of_emis != null ? Number(row.number_of_emis) : null,
+  });
 }
 
 function mapPayment(row) {
-  const amount = formatAmount(row.amount);
-  const returned_amount = formatAmount(row.returned_amount || 0);
-  const net_amount = formatAmount(amount - returned_amount);
+  const amounts = calculatePaymentAmounts({
+    amount: row.amount,
+    returned_amount: row.returned_amount || 0,
+  });
   return {
     id: row.id,
-    amount,
-    returned_amount,
-    net_amount,
-    my_contribution: net_amount,
+    ...amounts,
     date: formatTimestamp(row.payment_date),
     user_id: row.user_id,
     payment_type_id: row.payment_type_id,
@@ -128,6 +131,13 @@ function mapPayment(row) {
       ? {
           id: row.payment_type_id,
           name: row.payment_type_name,
+          flow:
+            row.payment_type_flow === "incoming" ||
+            row.payment_type_flow === "outgoing"
+              ? row.payment_type_flow
+              : Boolean(row.payment_type_is_income)
+                ? "incoming"
+                : "outgoing",
           is_income: Boolean(row.payment_type_is_income),
         }
       : undefined,
@@ -155,8 +165,8 @@ function validatePaymentPayload(body, { partial = false } = {}) {
   if (!partial || body.amount !== undefined) {
     if (body.amount === undefined || body.amount === null || body.amount === "") {
       errors.push("amount is required");
-    } else if (toAmount(body.amount) === null || toAmount(body.amount) <= 0) {
-      errors.push("amount must be a positive number");
+    } else if (toAmount(body.amount) === null || toAmount(body.amount) < 0) {
+      errors.push("amount must be a non-negative number (0 allowed)");
     }
   }
 
@@ -292,7 +302,8 @@ async function resolveEmiProductId(userId, emi) {
 const PAYMENT_SELECT = `
   SELECT p.id, p.amount, p.payment_date, p.user_id, p.payment_type_id,
          p.emi_product_id, p.created_at,
-         pt.name AS payment_type_name, pt.is_income AS payment_type_is_income,
+         pt.name AS payment_type_name, pt.flow AS payment_type_flow,
+         pt.is_income AS payment_type_is_income,
          ep.product_name AS emi_product_name,
          ep.emi_start_from,
          ep.already_paid,
@@ -484,17 +495,7 @@ router.post("/:id/returns", async (req, res) => {
     }
     const return_date = parseTimestamp(req.body.date) || nowTimestamp();
 
-    const paymentAmount = formatAmount(payment.rows[0].amount);
-    const alreadyReturned = formatAmount(payment.rows[0].returned_amount || 0);
-    const remaining = formatAmount(paymentAmount - alreadyReturned);
-
-    if (amount > remaining) {
-      return badRequest(
-        res,
-        `return amount exceeds remaining payment amount (available: ${remaining})`
-      );
-    }
-
+    // Returns may exceed the original payment (over-refund); net_amount can be negative.
     const inserted = await db.query(
       `INSERT INTO payment_returns (payment_id, user_id, amount, return_date)
        VALUES ($1, $2, $3, $4)

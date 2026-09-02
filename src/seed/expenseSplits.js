@@ -7,11 +7,47 @@ async function seedExpenseSplits() {
         id SERIAL PRIMARY KEY,
         expense_id INTEGER NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
         category VARCHAR(100) NOT NULL,
-        amount NUMERIC(18, 8) NOT NULL CHECK (amount > 0),
+        amount NUMERIC(18, 8) NOT NULL CHECK (amount >= 0),
         expense_type BOOLEAN NOT NULL DEFAULT TRUE,
         sort_order INTEGER NOT NULL DEFAULT 0,
         UNIQUE (expense_id, category)
       )
+    `);
+
+    // Allow zero-amount splits (placeholder expense before final payment)
+    await db.query(`
+      DO $$
+      DECLARE
+        r RECORD;
+      BEGIN
+        FOR r IN
+          SELECT c.conname
+          FROM pg_constraint c
+          JOIN pg_class t ON c.conrelid = t.oid
+          WHERE t.relname = 'expense_category_splits'
+            AND c.contype = 'c'
+            AND pg_get_constraintdef(c.oid) ILIKE '%amount%>%0%'
+            AND pg_get_constraintdef(c.oid) NOT ILIKE '%>=%0%'
+        LOOP
+          EXECUTE format(
+            'ALTER TABLE expense_category_splits DROP CONSTRAINT %I',
+            r.conname
+          );
+        END LOOP;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint c
+          JOIN pg_class t ON c.conrelid = t.oid
+          WHERE t.relname = 'expense_category_splits'
+            AND c.contype = 'c'
+            AND pg_get_constraintdef(c.oid) ILIKE '%amount%>=%0%'
+        ) THEN
+          ALTER TABLE expense_category_splits
+            ADD CONSTRAINT expense_category_splits_amount_check
+            CHECK (amount >= 0);
+        END IF;
+      END $$;
     `);
 
     // Add expense_type to existing splits table if missing
@@ -47,14 +83,12 @@ async function seedExpenseSplits() {
       FROM expenses e
       WHERE e.category IS NOT NULL
         AND TRIM(e.category) <> ''
-        AND e.amount > 0
+        AND e.amount >= 0
         AND NOT EXISTS (
           SELECT 1 FROM expense_category_splits s WHERE s.expense_id = e.id
         )
     `);
 
-    // Sync split expense_type from parent when still default-only legacy rows
-    // (safe no-op for already customized splits: only updates rows matching parent)
     await db.query(`
       UPDATE expense_category_splits s
       SET expense_type = e.expense_type

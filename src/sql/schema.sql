@@ -35,13 +35,14 @@ CREATE TABLE IF NOT EXISTS monthly_balances (
 -- ========== CATALOG ==========
 CREATE TABLE IF NOT EXISTS categories (
   id SERIAL PRIMARY KEY,
-  name VARCHAR(100) NOT NULL UNIQUE,
-  icon TEXT NOT NULL DEFAULT '/uploads/categories/default.svg'
+  name VARCHAR(100) NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS payment_types (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) NOT NULL UNIQUE,
+  flow VARCHAR(20) NOT NULL DEFAULT 'outgoing'
+    CHECK (flow IN ('incoming', 'outgoing')),
   is_income BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT NOW()
 );
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS expense_category_splits (
   id SERIAL PRIMARY KEY,
   expense_id INTEGER NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
   category VARCHAR(100) NOT NULL,
-  amount NUMERIC(18, 8) NOT NULL CHECK (amount > 0),
+  amount NUMERIC(18, 8) NOT NULL CHECK (amount >= 0),
   expense_type BOOLEAN NOT NULL DEFAULT TRUE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   UNIQUE (expense_id, category)

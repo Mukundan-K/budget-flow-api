@@ -4,6 +4,44 @@ Reference for database tables, calculation equations, and every HTTP API.
 
 Base URL: `http://localhost:5000`
 
+## Architecture (financial calculations)
+
+```text
+Database
+   ↓
+src/services/financial/*   ← authoritative formulas
+   ↓
+Canonical values (net, remaining, percentages, …)
+   ↓
+Dashboard / Overview / Activity / domain routes
+   ↓
+Frontend (presentation only)
+```
+
+Central module: `src/services/financial/`
+
+| File | Responsibility |
+|------|----------------|
+| `payment.service.js` | payment net / amounts |
+| `expense.service.js` | expense net, contribution, split returns |
+| `savings.service.js` | savings net |
+| `debt.service.js` | outstanding, debt_net |
+| `emi.service.js` | EMI progress % |
+| `balance.service.js` | previous balance, monthly Remaining |
+| `percentages.service.js` | used / necessary / saved shares |
+| `financialSummary.service.js` | dashboard/activity shaping |
+| `index.js` | barrel export |
+
+Primary formula (single implementation in `calculateMonthlyBalance`):
+
+```text
+Remaining = Incoming + Previous − Spent − Savings − Debt
+```
+
+Run unit tests: `npm test`
+
+---
+
 Standard response shape:
 
 ```json
@@ -37,8 +75,8 @@ Standard response shape:
 
 | Table | Purpose |
 |-------|---------|
-| `categories` | Expense category master (`name`, `icon`) |
-| `payment_types` | Payment type master (`name`, `is_income`) |
+| `categories` | Expense category master (`name`) |
+| `payment_types` | Payment type master (`name`, `flow`, `is_income` — independent fields) |
 | `persons` | Debt counterparty master (per user: `user_id`, `name`) |
 | `bank_accounts` | Savings bank accounts (per user: `name`, `is_active`) |
 | `emi_products` | EMI product catalog (per user: `product_name`, `emi_start_from`, `already_paid`, `number_of_emis`) |
@@ -79,8 +117,14 @@ debt.outstanding       = debt.net_amount
 ### Income / spent (per month)
 
 ```
-Incoming (income)  = SUM(net payments where payment_type.is_income = true)
-Outgoing payments  = SUM(net payments where payment_type.is_income = false)
+Incoming (all)     = SUM(net payments where payment_type.flow = 'incoming')
+  earned             = Incoming ∧ is_income = true
+  not_earned         = Incoming ∧ is_income = false
+Outgoing payments  = SUM(net payments where payment_type.flow = 'outgoing')
+
+Available          = Incoming (= earned + not_earned)
+available_split    = { total, earned, not_earned }
+Spendable          = Incoming + previous_month_balance  (= total_amount_to_spend)
 Expense total      = SUM(net expenses)
 Total Spent        = Expense total + Outgoing payments
 ```
@@ -104,7 +148,7 @@ received_net  = received_total − received_returned
 debt (report) = given_net − received_net
 ```
 
-Debt is **not** subtracted from Remaining.
+Debt (`debt_net` = given_net − received_net) **is subtracted** from Remaining.
 
 ### Previous balance
 
@@ -120,12 +164,13 @@ Chain starts from the user’s earliest activity month; each month’s Remaining
 ### Remaining (core balance)
 
 ```
-Available (total_amount_to_spend) = Incoming + previous_month_balance
-Total Spent                       = Expense total + Outgoing payments
-Total deductions                  = Total Spent + from_savings
+Available (available / available_split.total) = Incoming (= earned + not_earned)
+Spendable (total_amount_to_spend)             = Incoming + previous_month_balance
+Total Spent                                   = Expense total + Outgoing payments
+Total deductions                              = Total Spent + from_savings + Debt
 
-Remaining (current_balance)       = Available − Total Spent − from_savings
-                                  = (Incoming + previous_month_balance) − Total Spent − Savings
+Remaining (current_balance)                   = Spendable − Total Spent − from_savings − Debt
+                                              = (Incoming + previous_month_balance) − Total Spent − Savings − Debt
 ```
 
 Also exposed as:
@@ -136,13 +181,17 @@ Also exposed as:
 ### Dashboard cards
 
 ```
-income             = Incoming
+income / incoming  = all flow=incoming (= earned + not_earned)
+earned             = incoming ∧ is_income
+not_earned         = incoming ∧ !is_income
+available          = income (sum of incoming)
+available_split    = { total, earned, not_earned }
 previous_balance   = previous_month_balance (effective)
 from_savings       = savings month_net
-available          = income + previous_balance
 spent              = expense_total + outgoing_payments_total
-debt               = given_net − received_net   (display only)
-balance / Remaining = available − spent − from_savings
+debt               = given_net − received_net
+total_amount_to_spend = income + previous_balance
+balance / Remaining   = total_amount_to_spend − spent − from_savings − debt
 ```
 
 ### Activities month fields
@@ -151,8 +200,10 @@ balance / Remaining = available − spent − from_savings
 previous_month_balance             = effective previous (manual or calculated)
 previous_month_balance_calculated  = previous month Remaining
 previous_balance_manual            = whether edited
-payments.incoming_total            = Incoming for that month
-payments.outgoing_total            = Outgoing payments for that month
+payments.incoming_total            = Incoming for that month (flow=incoming)
+payments.earned_total              = earned incoming (is_income)
+payments.not_earned_total          = not-earned incoming
+payments.outgoing_total            = Outgoing payments (flow=outgoing)
 payments.bank_balance              = Remaining for that month
 payments.savings_balance           = lifetime savings balance as of end of that month
                                     (all credits − all debits with date ≤ month end)
@@ -190,14 +241,14 @@ expenses.total                     = necessary_total + unnecessary_total
 
 ### Categories — `/api/categories`
 
-Expense category CRUD. Create/update support multipart icon upload.
+Expense category CRUD.
 
 | Method | Path | Explanation |
 |--------|------|-------------|
-| `POST` | `/api/categories` | Create (`name`, optional `icon` file) |
+| `POST` | `/api/categories` | Create (`name`) |
 | `GET` | `/api/categories` | List all |
 | `GET` | `/api/categories/:id` | Get one |
-| `PUT` / `PATCH` | `/api/categories/:id` | Update name/icon |
+| `PUT` / `PATCH` | `/api/categories/:id` | Update name |
 | `DELETE` | `/api/categories/:id` | Delete |
 
 ---
@@ -206,8 +257,8 @@ Expense category CRUD. Create/update support multipart icon upload.
 
 | Method | Path | Explanation |
 |--------|------|-------------|
-| `POST` | `/api/payment-types` | Create `{ name, is_income }` |
-| `GET` | `/api/payment-types` | List (optional `?is_income=`) |
+| `POST` | `/api/payment-types` | Create `{ name, flow?, is_income? }` — `flow` and `is_income` are independent |
+| `GET` | `/api/payment-types` | List (`?is_income=` and/or `?flow=incoming\|outgoing`) |
 | `GET` | `/api/payment-types/:id` | Get one |
 | `PUT` / `PATCH` | `/api/payment-types/:id` | Update |
 | `DELETE` | `/api/payment-types/:id` | Delete (409 if used by payments) |
@@ -398,7 +449,10 @@ Incoming     = Σ income payment nets
 Spent        = Σ expense nets + Σ outgoing payment nets
 Savings      = credited − debited   (month)
 Previous     = manual OR previous month Remaining
-Remaining    = Incoming + Previous − Spent − Savings
+Spent        = Σ expense nets + Σ outgoing payment nets
+Savings      = credited − debited   (month)
+Debt         = given_net − received_net   (month)
+Remaining    = Incoming + Previous − Spent − Savings − Debt
 
 Next month’s calculated Previous = this month’s Remaining
 ```

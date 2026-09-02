@@ -13,6 +13,13 @@ const {
 } = require("../utils/datetime");
 const { getMonths, isValidMonth } = require("../masters/month.master");
 const { getYears, isValidYear } = require("../masters/year.master");
+const {
+  calculatePreviousBalance,
+  calculateMonthlyBalance,
+  buildDashboardFinancialBlock,
+  enrichEmiProduct,
+  pct: sharePct,
+} = require("../services/financial");
 
 function toAmount(value) {
   const amount = parseAmount(value);
@@ -92,10 +99,23 @@ function parseDashboardPeriod(month, year) {
   return { mode: "month", month: selectedMonth, year: selectedYear };
 }
 
-async function getIncomeTotalForMonth(userId, year, month) {
+async function getIncomingBreakdownForMonth(userId, year, month) {
   const { start, end } = monthRange(year, month);
   const result = await db.query(
-    `SELECT COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total
+    `SELECT
+       COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total,
+       COALESCE(SUM(
+         CASE WHEN pt.is_income = TRUE
+           THEN p.amount - COALESCE(ret.returned_amount, 0)
+           ELSE 0
+         END
+       ), 0) AS earned,
+       COALESCE(SUM(
+         CASE WHEN pt.is_income = FALSE
+           THEN p.amount - COALESCE(ret.returned_amount, 0)
+           ELSE 0
+         END
+       ), 0) AS not_earned
      FROM payments p
      JOIN payment_types pt ON pt.id = p.payment_type_id
      LEFT JOIN (
@@ -104,12 +124,23 @@ async function getIncomeTotalForMonth(userId, year, month) {
        GROUP BY payment_id
      ) ret ON ret.payment_id = p.id
      WHERE p.user_id = $1
-       AND pt.is_income = TRUE
+       AND pt.flow = 'incoming'
        AND p.payment_date >= $2
        AND p.payment_date <= $3`,
     [userId, start, end]
   );
-  return toAmount(result.rows[0].total);
+  const row = result.rows[0];
+  return {
+    total: toAmount(row.total),
+    earned: toAmount(row.earned),
+    not_earned: toAmount(row.not_earned),
+  };
+}
+
+/** @deprecated use getIncomingBreakdownForMonth — kept as alias for salary/income total */
+async function getIncomeTotalForMonth(userId, year, month) {
+  const breakdown = await getIncomingBreakdownForMonth(userId, year, month);
+  return breakdown.total;
 }
 
 async function getOutgoingPaymentsTotalForMonth(userId, year, month) {
@@ -124,7 +155,7 @@ async function getOutgoingPaymentsTotalForMonth(userId, year, month) {
        GROUP BY payment_id
      ) ret ON ret.payment_id = p.id
      WHERE p.user_id = $1
-       AND pt.is_income = FALSE
+       AND pt.flow = 'outgoing'
        AND p.payment_date >= $2
        AND p.payment_date <= $3`,
     [userId, start, end]
@@ -190,16 +221,13 @@ async function getExpenseTypeNetsForMonth(userId, year, month) {
          COALESCE(s.expense_type, e.expense_type, TRUE) AS is_necessary,
          CASE
            WHEN s.id IS NULL THEN
-             GREATEST(
-               e.amount - COALESCE((
-                 SELECT SUM(er.amount)
-                 FROM expense_returns er
-                 WHERE er.expense_id = e.id
-               ), 0),
-               0
-             )
+             e.amount - COALESCE((
+               SELECT SUM(er.amount)
+               FROM expense_returns er
+               WHERE er.expense_id = e.id
+             ), 0)
            ELSE
-             GREATEST(s.amount - COALESCE(r.returned_amount, 0), 0)
+             s.amount - COALESCE(r.returned_amount, 0)
          END AS net_amount
        FROM expenses e
        LEFT JOIN expense_category_splits s ON s.expense_id = e.id
@@ -316,16 +344,13 @@ async function getCategoryPolarArea(userId, start, end) {
          COALESCE(s.expense_type, e.expense_type, TRUE) AS is_necessary,
          CASE
            WHEN s.id IS NULL THEN
-             GREATEST(
-               e.amount - COALESCE((
-                 SELECT SUM(er.amount)
-                 FROM expense_returns er
-                 WHERE er.expense_id = e.id
-               ), 0),
-               0
-             )
+             e.amount - COALESCE((
+               SELECT SUM(er.amount)
+               FROM expense_returns er
+               WHERE er.expense_id = e.id
+             ), 0)
            ELSE
-             GREATEST(s.amount - COALESCE(r.returned_amount, 0), 0)
+             s.amount - COALESCE(r.returned_amount, 0)
          END AS net_amount
        FROM expenses e
        LEFT JOIN expense_category_splits s ON s.expense_id = e.id
@@ -354,12 +379,15 @@ async function getCategoryPolarArea(userId, start, end) {
     unnecessary_total: toAmount(row.unnecessary_total),
   }));
 
+  // Chart shows top 10 categories by total only
+  const topSlices = slices.slice(0, 10);
+
   const grand_total = roundMoney(
-    slices.reduce((sum, s) => sum + s.total, 0)
+    topSlices.reduce((sum, s) => sum + s.total, 0)
   );
 
   const withPct = assignPolarAreaColors(
-    slices.map((s) => ({
+    topSlices.map((s) => ({
       ...s,
       percentage:
         grand_total > 0 ? roundMoney((s.total / grand_total) * 100) : 0,
@@ -385,7 +413,7 @@ function periodRange(year, month, mode) {
 }
 
 function pct(part, whole) {
-  return whole > 0 ? roundMoney((part / whole) * 100) : 0;
+  return sharePct(part, whole);
 }
 
 /** Donut / pie — necessary vs unnecessary expenses */
@@ -546,7 +574,7 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
        GROUP BY payment_id
      ) ret ON ret.payment_id = p.id
      WHERE p.user_id = $1
-       AND pt.is_income = FALSE
+       AND pt.flow = 'outgoing'
        AND p.payment_date >= $2
        AND p.payment_date <= $3
      GROUP BY
@@ -591,20 +619,23 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
         row.already_paid != null ? Number(row.already_paid) : 0;
       const number_of_emis =
         row.number_of_emis != null ? Number(row.number_of_emis) : null;
-      const remaining =
-        number_of_emis != null
-          ? Math.max(0, number_of_emis - already_paid)
-          : null;
+      const emiProgress = enrichEmiProduct({
+        already_paid,
+        number_of_emis,
+      });
 
       group.groups.push({
         label: row.emi_product_name || "EMI",
         product_name: row.emi_product_name || "EMI",
         emi_product_id: row.emi_product_id || null,
         start_date: formatTimestamp(row.emi_start_from),
-        already_paid,
-        number_of_emis,
-        remaining,
-        emis_left: remaining,
+        already_paid: emiProgress.already_paid,
+        number_of_emis: emiProgress.number_of_emis,
+        paid: emiProgress.paid,
+        total: emiProgress.total,
+        remaining: emiProgress.remaining,
+        emis_left: emiProgress.emis_left,
+        progress_percentage: emiProgress.progress_percentage,
         total,
         amount: total,
         count,
@@ -732,8 +763,8 @@ function buildSpendingBreakdownChart({
 const MONTHLY_TREND_COLORS = {
   income: "#198754", // green
   spent: "#DC3545", // danger red
-  from_savings: "#0D9488", // teal
-  debt: "#E11D48", // crimson
+  from_savings: "#8FE388", // light / parrot green
+  debt: "#F97316", // orange
   balance: "#4F46E5", // indigo
 };
 
@@ -1004,15 +1035,20 @@ async function buildMonthOverview(userId, year, month) {
       cursor.year,
       cursor.month
     );
-    if (storedPrevious !== null) {
-      previousMonthBalance = storedPrevious;
-    }
+    const previous = calculatePreviousBalance({
+      manual: storedPrevious,
+      calculated: calculatedPreviousMonthBalance,
+    });
+    previousMonthBalance = previous.previous_balance;
 
-    const salary = await getIncomeTotalForMonth(
+    const incomingBreakdown = await getIncomingBreakdownForMonth(
       userId,
       cursor.year,
       cursor.month
     );
+    const salary = incomingBreakdown.total;
+    const earned = incomingBreakdown.earned;
+    const not_earned = incomingBreakdown.not_earned;
     const outgoingPayments = await getOutgoingPaymentsTotalForMonth(
       userId,
       cursor.year,
@@ -1036,13 +1072,24 @@ async function buildMonthOverview(userId, year, month) {
       cursor.month
     );
     const debt = debtInfo.debt;
-    // Remaining = (Incoming + Prev.) − Total Spent − Savings
-    // Total Spent = expenses + outgoing payments
-    // Debt is reported separately and does not affect Remaining.
-    const totalSpent = roundMoney(expenseTotal + outgoingPayments);
-    const totalAmountToSpend = roundMoney(salary + previousMonthBalance);
-    const totalDeductions = roundMoney(totalSpent + fromSavings);
-    const currentBalance = roundMoney(totalAmountToSpend - totalDeductions);
+
+    // Authoritative Remaining formula (centralized):
+    // Remaining = Incoming + Previous − Spent − Savings − Debt
+    const monthly = calculateMonthlyBalance({
+      incoming: salary,
+      earned,
+      not_earned,
+      previous: previousMonthBalance,
+      expense_total: expenseTotal,
+      outgoing_payments_total: outgoingPayments,
+      savings: fromSavings,
+      debt,
+    });
+    const totalAmountToSpend = monthly.total_amount_to_spend;
+    const available = monthly.available;
+    const totalSpent = monthly.spent;
+    const totalDeductions = monthly.total_deductions;
+    const currentBalance = monthly.remaining;
 
     if (cursor.year === target.year && cursor.month === target.month) {
       const latestSalary = await getLatestSalaryPayment(
@@ -1065,10 +1112,15 @@ async function buildMonthOverview(userId, year, month) {
           : null,
         salary,
         // Effective value used in balance math (manual override or calculated)
-        previous_month_balance: previousMonthBalance,
+        previous_month_balance: previous.previous_month_balance,
         // Auto value = previous month Remaining (before any edit)
-        previous_month_balance_calculated: calculatedPreviousMonthBalance,
-        previous_month_balance_manual: storedPrevious !== null,
+        previous_month_balance_calculated:
+          previous.previous_month_balance_calculated,
+        previous_month_balance_manual: previous.previous_month_balance_manual,
+        // Canonical aliases
+        previous_balance: previous.previous_balance,
+        previous_balance_calculated: previous.previous_balance_calculated,
+        previous_balance_manual: previous.previous_balance_manual,
         from_savings: fromSavings,
         savings_credited: fromSavings,
         savings_month_net: fromSavings,
@@ -1091,6 +1143,15 @@ async function buildMonthOverview(userId, year, month) {
         emi_count: emiStats.emi_count,
         // Remaining — becomes next month's calculated previous balance
         current_balance: currentBalance,
+        remaining: currentBalance,
+        incoming: salary,
+        earned,
+        not_earned,
+        // Available = sum of all incoming; split earned vs not earned
+        available,
+        available_split: monthly.available_split,
+        spent: totalSpent,
+        savings: fromSavings,
       };
     }
 
@@ -1103,10 +1164,10 @@ async function buildMonthOverview(userId, year, month) {
 
 /**
  * Dashboard card payload — same month math as overview, clear labels for UI.
- * Available = Incoming + Prev. balance
- * Total Spent = expenses (net) + outgoing payments (net)
- * Remaining  = Available − Total Spent − Savings
- *            = (Incoming + Prev.) − Spent − Savings
+ * Available = sum of all incoming (flow=incoming), split earned / not_earned
+ * Spendable (total_amount_to_spend) = Incoming + Prev. balance
+ * Total Spent = expenses (net) + outgoing payments (flow=outgoing)
+ * Remaining  = Spendable − Total Spent − Savings − Debt
  *
  * mode "month" → one month; mode "year" → full calendar year totals
  * charts: polar_area, expense_type, cashflow, spending_breakdown, monthly_trend
@@ -1126,14 +1187,24 @@ async function buildDashboard(userId, year, month, mode = "month") {
   const monthly_trend_points = await collectMonthlyTrendPoints(userId, year);
 
   const income = overview.salary;
+  const earned = overview.earned;
+  const not_earned = overview.not_earned;
   const previous_balance = overview.previous_month_balance;
   const from_savings = overview.from_savings;
-  const available = overview.total_amount_to_spend;
+  const available = overview.available;
+  const available_split = overview.available_split;
   const spent = roundMoney(
     overview.expense_total + overview.outgoing_payments_total
   );
   const debt = overview.debt;
   const balance = overview.current_balance;
+
+  const financial = buildDashboardFinancialBlock(overview, {
+    necessary: typeNets.necessary,
+    unnecessary: typeNets.unnecessary,
+    saved: overview.savings_amount_saved,
+    debited: overview.savings_amount_debited,
+  });
 
   const charts = buildChartsBundle({
     polar_area,
@@ -1165,15 +1236,22 @@ async function buildDashboard(userId, year, month, mode = "month") {
       years: getYears(),
     },
 
+    // Legacy flat card fields (preserved for existing consumers)
     income,
+    earned,
+    not_earned,
     previous_balance,
     from_savings,
     available,
+    available_split,
     spent,
     debt,
     balance,
     necessary: typeNets.necessary,
     unnecessary: typeNets.unnecessary,
+
+    // Canonical nested financial block (additive)
+    financial,
 
     // Charts (prefer data.charts.*). polar_area kept at root for compatibility.
     // EMI details live under charts.spending_breakdown.emi / slices[key=emi]
@@ -1190,6 +1268,12 @@ async function buildDashboard(userId, year, month, mode = "month") {
       debt_given_net: overview.debt_given_net,
       debt_received_net: overview.debt_received_net,
       total_deductions: overview.total_deductions,
+      dashboard_used_percentage:
+        financial?.percentages?.dashboard_used_percentage ?? 0,
+      necessary_share_percentage:
+        financial?.percentages?.necessary_share_percentage ?? 0,
+      saved_share_percentage:
+        financial?.percentages?.saved_share_percentage ?? 0,
     },
   };
 }
@@ -1219,6 +1303,8 @@ async function collectMonthlyTrendPoints(userId, year) {
 
 async function buildDashboardForYear(userId, year) {
   let income = 0;
+  let earned = 0;
+  let not_earned = 0;
   let expenseTotal = 0;
   let outgoingPayments = 0;
   let fromSavings = 0;
@@ -1251,6 +1337,8 @@ async function buildDashboardForYear(userId, year) {
     );
 
     income = roundMoney(income + overview.salary);
+    earned = roundMoney(earned + (overview.earned || 0));
+    not_earned = roundMoney(not_earned + (overview.not_earned || 0));
     expenseTotal = roundMoney(expenseTotal + overview.expense_total);
     outgoingPayments = roundMoney(
       outgoingPayments + overview.outgoing_payments_total
@@ -1270,6 +1358,8 @@ async function buildDashboardForYear(userId, year) {
       month: m,
       year: Number(year),
       income: overview.salary,
+      earned: overview.earned || 0,
+      not_earned: overview.not_earned || 0,
       spent: monthSpent,
       from_savings: overview.from_savings,
       debt: overview.debt,
@@ -1285,10 +1375,16 @@ async function buildDashboardForYear(userId, year) {
     }
   }
 
-  const available = roundMoney(income + previous_balance);
+  // Available = sum of all incoming (earned + not_earned)
+  const available = income;
+  const available_split = {
+    total: available,
+    earned,
+    not_earned,
+  };
   const spent = roundMoney(expenseTotal + outgoingPayments);
-  // Remaining = Available − Spent − Savings (debt excluded)
-  const total_deductions = roundMoney(fromSavings + spent);
+  // Remaining = Incoming + Previous − Spent − Savings − Debt
+  const total_deductions = roundMoney(fromSavings + spent + debt);
 
   const { start, end } = periodRange(year, null, "year");
   const polar_area = await getCategoryPolarArea(userId, start, end);
@@ -1325,9 +1421,12 @@ async function buildDashboardForYear(userId, year) {
     },
 
     income,
+    earned,
+    not_earned,
     previous_balance,
     from_savings: fromSavings,
     available,
+    available_split,
     spent,
     debt,
     balance,
@@ -1346,6 +1445,7 @@ async function buildDashboardForYear(userId, year) {
       debt_given_net: debtGivenNet,
       debt_received_net: debtReceivedNet,
       total_deductions,
+      total_amount_to_spend: roundMoney(income + previous_balance),
     },
   };
 }

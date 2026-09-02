@@ -17,6 +17,7 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
+const { calculateDebtAmounts, calculateDebtNet } = require("../services/financial");
 
 /**
  * debt_type:
@@ -43,9 +44,10 @@ function parseDebtType(value) {
 }
 
 function mapDebt(row) {
-  const amount = formatAmount(row.amount);
-  const returned_amount = formatAmount(row.returned_amount || 0);
-  const net_amount = formatAmount(amount - returned_amount);
+  const amounts = calculateDebtAmounts({
+    amount: row.amount,
+    returned_amount: row.returned_amount || 0,
+  });
   return {
     id: row.id,
     person_id: row.person_id,
@@ -56,10 +58,12 @@ function mapDebt(row) {
           name: row.person_name,
         }
       : undefined,
-    amount,
-    returned_amount,
-    net_amount,
-    outstanding: net_amount,
+    amount: amounts.amount,
+    returned_amount: amounts.returned_amount,
+    net_amount: amounts.net_amount,
+    outstanding: amounts.outstanding,
+    is_pending_zero: amounts.is_pending_zero,
+    has_pending: amounts.has_pending,
     debt_type: row.debt_type,
     date: formatTimestamp(row.debt_date),
     user_id: row.user_id,
@@ -215,7 +219,7 @@ router.get("/details", async (req, res) => {
     const received_outstanding = sumNet(received);
 
     // Net debt for balance: given outstanding − received outstanding
-    const debt_net = formatAmount(given_outstanding - received_outstanding);
+    const debt_net = calculateDebtNet(given_outstanding, received_outstanding);
 
     return success(
       res,

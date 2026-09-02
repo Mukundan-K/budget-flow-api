@@ -1,7 +1,4 @@
 const express = require("express");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const router = express.Router();
 const db = require("../db");
 const {
@@ -13,47 +10,6 @@ const {
   serverError,
 } = require("../utils/response");
 
-const uploadsDir = path.join(__dirname, "../../uploads/categories");
-const DEFAULT_ICON = "/uploads/categories/default.svg";
-const PROTECTED_ICONS = new Set(["default.svg", "home.svg"]);
-
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${unique}${path.extname(file.originalname)}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 2 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (!file.mimetype.startsWith("image/")) {
-      return cb(new Error("Icon must be an image file"));
-    }
-    cb(null, true);
-  },
-});
-
-function iconUrl(filename) {
-  return `/uploads/categories/${filename}`;
-}
-
-function removeIconFile(iconPath) {
-  if (!iconPath) return;
-  const filename = path.basename(iconPath);
-  if (PROTECTED_ICONS.has(filename)) return;
-  const fullPath = path.join(uploadsDir, filename);
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
-  }
-}
-
 function validateName(name, { required = true } = {}) {
   if (name === undefined) {
     return required ? "name is required" : null;
@@ -64,24 +20,21 @@ function validateName(name, { required = true } = {}) {
   return null;
 }
 
-function handleUpload(req, res, next) {
-  upload.single("icon")(req, res, (err) => {
-    if (err) {
-      return badRequest(res, err.message);
-    }
-    next();
-  });
+function mapCategory(row) {
+  return {
+    id: row.id,
+    name: row.name,
+  };
 }
 
 async function updateCategory(req, res) {
   try {
     const existing = await db.query(
-      `SELECT id, name, icon FROM categories WHERE id = $1`,
+      `SELECT id, name FROM categories WHERE id = $1`,
       [req.params.id]
     );
 
     if (existing.rows.length === 0) {
-      if (req.file) removeIconFile(req.file.filename);
       return notFound(res, "Category not found");
     }
 
@@ -89,7 +42,6 @@ async function updateCategory(req, res) {
       required: req.body.name !== undefined,
     });
     if (nameError) {
-      if (req.file) removeIconFile(req.file.filename);
       return badRequest(res, nameError);
     }
 
@@ -98,23 +50,17 @@ async function updateCategory(req, res) {
       req.body.name !== undefined
         ? String(req.body.name).trim()
         : current.name;
-    const icon = req.file ? iconUrl(req.file.filename) : current.icon;
 
     const result = await db.query(
       `UPDATE categories
-       SET name = $1, icon = $2
-       WHERE id = $3
-       RETURNING id, name, icon`,
-      [name, icon, req.params.id]
+       SET name = $1
+       WHERE id = $2
+       RETURNING id, name`,
+      [name, req.params.id]
     );
 
-    if (req.file && current.icon) {
-      removeIconFile(current.icon);
-    }
-
-    return success(res, result.rows[0], "Category updated successfully");
+    return success(res, mapCategory(result.rows[0]), "Category updated successfully");
   } catch (err) {
-    if (req.file) removeIconFile(req.file.filename);
     if (err.code === "23505") {
       return conflict(res, "Category already exists");
     }
@@ -124,27 +70,24 @@ async function updateCategory(req, res) {
 }
 
 // Create category — 201
-router.post("/", handleUpload, async (req, res) => {
+router.post("/", async (req, res) => {
   try {
     const nameError = validateName(req.body.name);
     if (nameError) {
-      if (req.file) removeIconFile(req.file.filename);
       return badRequest(res, nameError);
     }
 
     const name = String(req.body.name).trim();
-    const icon = req.file ? iconUrl(req.file.filename) : DEFAULT_ICON;
 
     const result = await db.query(
-      `INSERT INTO categories (name, icon)
-       VALUES ($1, $2)
-       RETURNING id, name, icon`,
-      [name, icon]
+      `INSERT INTO categories (name)
+       VALUES ($1)
+       RETURNING id, name`,
+      [name]
     );
 
-    return created(res, result.rows[0], "Category created successfully");
+    return created(res, mapCategory(result.rows[0]), "Category created successfully");
   } catch (err) {
-    if (req.file) removeIconFile(req.file.filename);
     if (err.code === "23505") {
       return conflict(res, "Category already exists");
     }
@@ -157,25 +100,28 @@ router.post("/", handleUpload, async (req, res) => {
 // Optional filter: ?search=home (case-insensitive name match)
 router.get("/", async (req, res) => {
   try {
-    const search = typeof req.query.search === "string"
-      ? req.query.search.trim()
-      : "";
+    const search =
+      typeof req.query.search === "string" ? req.query.search.trim() : "";
 
     let result;
     if (search) {
       result = await db.query(
-        `SELECT id, name, icon FROM categories
+        `SELECT id, name FROM categories
          WHERE name ILIKE $1
          ORDER BY name ASC`,
         [`%${search}%`]
       );
     } else {
       result = await db.query(
-        `SELECT id, name, icon FROM categories ORDER BY name ASC`
+        `SELECT id, name FROM categories ORDER BY name ASC`
       );
     }
 
-    return success(res, result.rows, "Categories fetched successfully");
+    return success(
+      res,
+      result.rows.map(mapCategory),
+      "Categories fetched successfully"
+    );
   } catch (err) {
     console.error(err);
     return serverError(res, "Error fetching categories");
@@ -186,7 +132,7 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, name, icon FROM categories WHERE id = $1`,
+      `SELECT id, name FROM categories WHERE id = $1`,
       [req.params.id]
     );
 
@@ -194,7 +140,7 @@ router.get("/:id", async (req, res) => {
       return notFound(res, "Category not found");
     }
 
-    return success(res, result.rows[0], "Category fetched successfully");
+    return success(res, mapCategory(result.rows[0]), "Category fetched successfully");
   } catch (err) {
     console.error(err);
     return serverError(res, "Error fetching category");
@@ -202,14 +148,14 @@ router.get("/:id", async (req, res) => {
 });
 
 // Update category — 200
-router.put("/:id", handleUpload, updateCategory);
-router.patch("/:id", handleUpload, updateCategory);
+router.put("/:id", updateCategory);
+router.patch("/:id", updateCategory);
 
 // Delete category — 200
 router.delete("/:id", async (req, res) => {
   try {
     const result = await db.query(
-      `DELETE FROM categories WHERE id = $1 RETURNING id, name, icon`,
+      `DELETE FROM categories WHERE id = $1 RETURNING id, name`,
       [req.params.id]
     );
 
@@ -217,9 +163,11 @@ router.delete("/:id", async (req, res) => {
       return notFound(res, "Category not found");
     }
 
-    removeIconFile(result.rows[0].icon);
-
-    return success(res, result.rows[0], "Category deleted successfully");
+    return success(
+      res,
+      mapCategory(result.rows[0]),
+      "Category deleted successfully"
+    );
   } catch (err) {
     console.error(err);
     return serverError(res, "Error deleting category");

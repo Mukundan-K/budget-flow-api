@@ -3,6 +3,8 @@
 CREATE TABLE IF NOT EXISTS payment_types (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) NOT NULL UNIQUE,
+  flow VARCHAR(20) NOT NULL DEFAULT 'outgoing'
+    CHECK (flow IN ('incoming', 'outgoing')),
   is_income BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT NOW()
 );
