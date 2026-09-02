@@ -222,7 +222,7 @@ expenses.total                     = necessary_total + unnecessary_total
 |--------|------|-------------|
 | `GET` | `/auth/google` | Start Google OAuth login |
 | `GET` | `/auth/google/callback` | OAuth callback; issues access + refresh tokens, redirects to frontend |
-| `POST` | `/auth/refresh-token` | Body `{ refreshToken }` → new access token |
+| `POST` | `/auth/refresh-token` | Body `{ refreshToken }` → new access + refresh tokens (sliding 30-day session) |
 | `GET` | `/auth/me` | Current user (requires Bearer access token) |
 | `GET` | `/auth/user/:id` | Fetch user by id |
 | `POST` | `/auth/logout` | Clears stored refresh token |

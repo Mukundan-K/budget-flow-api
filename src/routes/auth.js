@@ -3,39 +3,25 @@ const passport = require("passport");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
 const authenticate = require("../middleware/authenticate");
+const { tokenPair } = require("../utils/tokens");
 const {
   success,
   unauthorized,
-  forbidden,
   notFound,
   serverError,
 } = require("../utils/response");
 
 const router = express.Router();
 
-function generateAccessToken(user) {
-  return jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-    },
-    process.env.JWT_ACCESS_SECRET,
-    {
-      expiresIn: "15m",
-    }
-  );
-}
+async function issueTokens(user) {
+  const tokens = tokenPair(user);
 
-function generateRefreshToken(user) {
-  return jwt.sign(
-    {
-      id: user.id,
-    },
-    process.env.JWT_REFRESH_SECRET,
-    {
-      expiresIn: "30d",
-    }
-  );
+  await pool.query("UPDATE users SET refresh_token=$1 WHERE id=$2", [
+    tokens.refreshToken,
+    user.id,
+  ]);
+
+  return tokens;
 }
 
 function mapUser(row) {
@@ -61,55 +47,52 @@ router.get(
     session: false,
   }),
   async (req, res) => {
-    const accessToken = generateAccessToken(req.user);
-    const refreshToken = generateRefreshToken(req.user);
+    try {
+      const { accessToken, refreshToken } = await issueTokens(req.user);
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:4200";
 
-    await pool.query(
-      "UPDATE users SET refresh_token=$1 WHERE id=$2",
-      [refreshToken, req.user.id]
-    );
-
-    res.redirect(
-      `${process.env.FRONTEND_URL}/login?accessToken=${accessToken}&refreshToken=${refreshToken}`
-    );
+      res.redirect(
+        `${frontendUrl}/login?accessToken=${encodeURIComponent(
+          accessToken
+        )}&refreshToken=${encodeURIComponent(refreshToken)}`
+      );
+    } catch (err) {
+      console.error(err);
+      return serverError(res, "Error completing login");
+    }
   }
 );
 
 router.post("/refresh-token", async (req, res) => {
-  const { refreshToken } = req.body;
+  const { refreshToken } = req.body || {};
 
   if (!refreshToken) {
     return unauthorized(res, "Refresh token missing");
   }
 
   try {
-    const decoded = jwt.verify(
-      refreshToken,
-      process.env.JWT_REFRESH_SECRET
-    );
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
 
-    const user = await pool.query(
-      "SELECT * FROM users WHERE id=$1",
-      [decoded.id]
-    );
+    const user = await pool.query("SELECT * FROM users WHERE id=$1", [
+      decoded.id,
+    ]);
 
     if (user.rows.length === 0) {
-      return forbidden(res, "User not found");
+      return unauthorized(res, "User not found");
     }
 
-    if (user.rows[0].refresh_token !== refreshToken) {
-      return forbidden(res, "Invalid refresh token");
+    if (!user.rows[0].refresh_token || user.rows[0].refresh_token !== refreshToken) {
+      return unauthorized(res, "Invalid refresh token");
     }
 
-    const newAccessToken = generateAccessToken(user.rows[0]);
+    const tokens = await issueTokens(user.rows[0]);
 
-    return success(
-      res,
-      { accessToken: newAccessToken },
-      "Access token refreshed successfully"
-    );
+    return success(res, tokens, "Access token refreshed successfully");
   } catch (err) {
-    return forbidden(res, "Invalid refresh token");
+    if (err.name === "TokenExpiredError") {
+      return unauthorized(res, "Refresh token expired");
+    }
+    return unauthorized(res, "Invalid refresh token");
   }
 });
 
@@ -157,16 +140,25 @@ router.get("/user/:id", async (req, res) => {
 
 router.post("/logout", async (req, res) => {
   try {
-    const { userId } = req.body;
+    const { userId, refreshToken } = req.body || {};
+    let id = userId;
 
-    if (!userId) {
-      return unauthorized(res, "userId is required");
+    if (!id && refreshToken) {
+      try {
+        const decoded = jwt.verify(
+          refreshToken,
+          process.env.JWT_REFRESH_SECRET
+        );
+        id = decoded.id;
+      } catch (err) {
+        const decoded = jwt.decode(refreshToken);
+        id = decoded && decoded.id;
+      }
     }
 
-    await pool.query(
-      "UPDATE users SET refresh_token=NULL WHERE id=$1",
-      [userId]
-    );
+    if (id) {
+      await pool.query("UPDATE users SET refresh_token=NULL WHERE id=$1", [id]);
+    }
 
     return success(res, null, "Logged out");
   } catch (err) {
