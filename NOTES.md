@@ -68,7 +68,7 @@ Standard response shape:
 | Table | Purpose |
 |-------|---------|
 | `users` | Google OAuth users (`name`, `email`, `google_id`, `photo`, `refresh_token`) |
-| `expenses` | Expense records (`amount`, `expense_type` boolean necessary/unnecessary, `expense_date`, `category`, `user_id`) |
+| `expenses` | Expense records (`amount`, `expense_type` boolean necessary/unnecessary, `expense_date`, `category`, `note`, `user_id`) |
 | `monthly_balances` | Manual previous-month-balance overrides per `user_id` + `month` + `year` |
 
 ### Catalog / masters
@@ -122,8 +122,8 @@ Incoming (all)     = SUM(net payments where payment_type.flow = 'incoming')
   not_earned         = Incoming ∧ is_income = false
 Outgoing payments  = SUM(net payments where payment_type.flow = 'outgoing')
 
-Available          = Incoming (= earned + not_earned)
-available_split    = { total, earned, not_earned }
+Available          = earned + previous_month_balance
+available_split    = { total, earned, not_earned, previous }
 Spendable          = Incoming + previous_month_balance  (= total_amount_to_spend)
 Expense total      = SUM(net expenses)
 Total Spent        = Expense total + Outgoing payments
@@ -164,7 +164,7 @@ Chain starts from the user’s earliest activity month; each month’s Remaining
 ### Remaining (core balance)
 
 ```
-Available (available / available_split.total) = Incoming (= earned + not_earned)
+Available (available / available_split.total) = earned + previous_month_balance
 Spendable (total_amount_to_spend)             = Incoming + previous_month_balance
 Total Spent                                   = Expense total + Outgoing payments
 Total deductions                              = Total Spent + from_savings + Debt
@@ -184,8 +184,8 @@ Also exposed as:
 income / incoming  = all flow=incoming (= earned + not_earned)
 earned             = incoming ∧ is_income
 not_earned         = incoming ∧ !is_income
-available          = income (sum of incoming)
-available_split    = { total, earned, not_earned }
+available          = earned + previous_balance
+available_split    = { total, earned, not_earned, previous }
 previous_balance   = previous_month_balance (effective)
 from_savings       = savings month_net
 spent              = expense_total + outgoing_payments_total
@@ -308,7 +308,7 @@ Supports category splits and per-category returns.
 
 | Method | Path | Explanation |
 |--------|------|-------------|
-| `POST` | `/api/expenses` | Create expense (optional splits) |
+| `POST` | `/api/expenses` | Create expense (optional splits, optional `note`) |
 | `GET` | `/api/expenses` | List (`user_id`, date/month/year filters) |
 | `GET` | `/api/expenses/pie-chart` | Category pie data for period |
 | `GET` | `/api/expenses/:id` | Get one (+ splits/returns) |
@@ -319,6 +319,8 @@ Supports category splits and per-category returns.
 | `DELETE` | `/api/expenses/:id/returns/:returnId` | Delete return |
 
 `expense_type`: `true` = necessary, `false` = unnecessary.
+
+`note`: optional string (max 500 chars) describing what the expense was for. Empty string is stored as `null`.
 
 ---
 
@@ -365,6 +367,7 @@ Uses **single** `person_id` (from persons master).
 | Method | Path | Explanation |
 |--------|------|-------------|
 | `GET` | `/api/debts/details?user_id=&month=&year=` | Given vs received totals, outstanding, item lists |
+| `GET` | `/api/debts/pending-by-person?user_id=` | All-time pending given/received per person (not month-filtered) |
 | `POST` | `/api/debts` | Create `{ user_id, person_id, amount, debt_type, date? }` |
 | `GET` | `/api/debts?user_id=` | List (optional `person_id`, `debt_type`, date/month) |
 | `GET` | `/api/debts/:id` | Get one (+ returns) |
@@ -383,6 +386,16 @@ given.outstanding     = SUM(given nets)
 received.outstanding  = SUM(received nets)
 debt_net              = given.outstanding − received.outstanding
 ```
+
+Pending by person (all debts, no month filter):
+
+```
+person.given_outstanding     = SUM(outstanding given debts for that person)
+person.received_outstanding  = SUM(outstanding received debts for that person)
+person.net                   = given_outstanding − received_outstanding
+```
+
+Only people with pending given or received (> 0) are included.
 
 ---
 

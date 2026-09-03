@@ -3,6 +3,7 @@ const { safePercentage } = require("./_helpers");
 
 /**
  * Dashboard used % = min(100, round(total_deductions / available × 100))
+ * available = earned + previous_month_balance
  */
 function calculateDashboardUsedPercentage(totalDeductions, available) {
   return safePercentage(totalDeductions, available, { clamp: true });

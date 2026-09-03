@@ -10,7 +10,7 @@ const { calculateDashboardPercentages } = require("./percentages.service");
 const { calculateSavingsAmounts } = require("./savings.service");
 const { calculateDebtSummary } = require("./debt.service");
 const { calculateEmiProgress } = require("./emi.service");
-const { splitAvailableFromIncoming } = require("./payment.service");
+const { splitAvailableFromEarnedAndPrevious } = require("./payment.service");
 const { roundMoney, toAmount } = require("./_helpers");
 
 /**
@@ -32,7 +32,7 @@ function buildDashboardFinancialBlock(overview, extras = {}) {
 
   const percentages = calculateDashboardPercentages({
     total_deductions: summary.total_deductions,
-    available: summary.total_amount_to_spend,
+    available: summary.available,
     necessary,
     unnecessary,
     saved,
@@ -116,7 +116,8 @@ function enrichEmiProduct(product) {
 
 /**
  * Activity month payment totals from bucket + overview balances.
- * Incoming = earned + not_earned (flow=incoming); available mirrors that split.
+ * Incoming = earned + not_earned (flow=incoming).
+ * Available = earned + previous_month_balance.
  */
 function buildActivityMonthFinancials({
   earned_total = 0,
@@ -125,27 +126,31 @@ function buildActivityMonthFinancials({
   expense_total = 0,
   overviewBalances = {},
 } = {}) {
-  const available = splitAvailableFromIncoming({
+  const previous = toAmount(overviewBalances.previous_month_balance);
+  const available = splitAvailableFromEarnedAndPrevious({
     earned: earned_total,
     not_earned: not_earned_total,
+    previous,
   });
   const outgoing = toAmount(outgoing_total);
   const spent = roundMoney(toAmount(expense_total) + outgoing);
+  const incoming = roundMoney(available.earned + available.not_earned);
 
   return {
-    incoming: available.total,
+    incoming,
     earned: available.earned,
     not_earned: available.not_earned,
     available: {
       total: available.total,
       earned: available.earned,
       not_earned: available.not_earned,
+      previous: available.previous,
     },
     outgoing,
     spent,
     bank_balance: toAmount(overviewBalances.bank_balance),
     savings_balance: toAmount(overviewBalances.savings_balance),
-    previous_month_balance: toAmount(overviewBalances.previous_month_balance),
+    previous_month_balance: previous,
     previous_month_balance_calculated: toAmount(
       overviewBalances.previous_month_balance_calculated
     ),

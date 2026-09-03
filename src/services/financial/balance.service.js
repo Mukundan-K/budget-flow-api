@@ -1,5 +1,8 @@
 const { roundMoney, toAmount } = require("./_helpers");
-const { splitAvailableFromIncoming } = require("./payment.service");
+const {
+  splitAvailableFromIncoming,
+  splitAvailableFromEarnedAndPrevious,
+} = require("./payment.service");
 
 /**
  * Effective previous balance:
@@ -29,7 +32,7 @@ function calculatePreviousBalance({
  *   Remaining = Incoming + Previous − Spent − Savings − Debt
  *
  * Incoming = all payments with flow = incoming (= earned + not_earned)
- * Available (user-facing) = Incoming, split into earned / not_earned
+ * Available (user-facing) = earned + previous_month_balance
  * Spendable (total_amount_to_spend) = Incoming + Previous
  *
  * Spent = expense nets + outgoing payment nets (flow = outgoing)
@@ -54,13 +57,13 @@ function calculateMonthlyBalance({
   let income;
 
   if (earned !== undefined || not_earned !== undefined) {
-    const split = splitAvailableFromIncoming({
+    const incomingSplit = splitAvailableFromIncoming({
       earned: earned || 0,
       not_earned: not_earned || 0,
     });
-    earnedAmt = split.earned;
-    notEarnedAmt = split.not_earned;
-    income = split.total;
+    earnedAmt = incomingSplit.earned;
+    notEarnedAmt = incomingSplit.not_earned;
+    income = incomingSplit.total;
   } else {
     income = toAmount(incoming);
     earnedAmt = income;
@@ -79,12 +82,18 @@ function calculateMonthlyBalance({
     spentValue = toAmount(spent);
   }
 
-  const available_split = {
-    total: income,
+  const split = splitAvailableFromEarnedAndPrevious({
     earned: earnedAmt,
     not_earned: notEarnedAmt,
+    previous: prev,
+  });
+  const available = split.total;
+  const available_split = {
+    total: split.total,
+    earned: split.earned,
+    not_earned: split.not_earned,
+    previous: split.previous,
   };
-  const available = income;
 
   const total_amount_to_spend = roundMoney(income + prev);
   const total_deductions = roundMoney(spentValue + savingsNet + debtNet);

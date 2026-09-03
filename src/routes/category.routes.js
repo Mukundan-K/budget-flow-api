@@ -10,6 +10,10 @@ const {
   serverError,
 } = require("../utils/response");
 
+function readBody(req) {
+  return req.body && typeof req.body === "object" ? req.body : {};
+}
+
 function validateName(name, { required = true } = {}) {
   if (name === undefined) {
     return required ? "name is required" : null;
@@ -38,8 +42,9 @@ async function updateCategory(req, res) {
       return notFound(res, "Category not found");
     }
 
-    const nameError = validateName(req.body.name, {
-      required: req.body.name !== undefined,
+    const body = readBody(req);
+    const nameError = validateName(body.name, {
+      required: body.name !== undefined,
     });
     if (nameError) {
       return badRequest(res, nameError);
@@ -47,9 +52,7 @@ async function updateCategory(req, res) {
 
     const current = existing.rows[0];
     const name =
-      req.body.name !== undefined
-        ? String(req.body.name).trim()
-        : current.name;
+      body.name !== undefined ? String(body.name).trim() : current.name;
 
     const result = await db.query(
       `UPDATE categories
@@ -72,12 +75,13 @@ async function updateCategory(req, res) {
 // Create category — 201
 router.post("/", async (req, res) => {
   try {
-    const nameError = validateName(req.body.name);
+    const body = readBody(req);
+    const nameError = validateName(body.name);
     if (nameError) {
       return badRequest(res, nameError);
     }
 
-    const name = String(req.body.name).trim();
+    const name = String(body.name).trim();
 
     const result = await db.query(
       `INSERT INTO categories (name)

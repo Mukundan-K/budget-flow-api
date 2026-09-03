@@ -24,12 +24,14 @@ function calculatePaymentAmounts({ amount, returned_amount = 0 } = {}) {
 }
 
 /**
- * Available from incoming payments (flow = incoming).
- * Split by is_income (earned vs not earned) — independent of flow.
+ * Incoming split by is_income (earned vs not earned) — independent of flow.
  *
- *   available.total      = earned + not_earned  (= all incoming)
- *   available.earned     = incoming ∧ is_income
- *   available.not_earned = incoming ∧ !is_income
+ *   incoming            = earned + not_earned  (all flow=incoming)
+ *   earned              = incoming ∧ is_income
+ *   not_earned          = incoming ∧ !is_income
+ *
+ * User-facing Available is computed separately:
+ *   available           = earned + previous_month_balance
  */
 function splitAvailableFromIncoming({ earned = 0, not_earned = 0 } = {}) {
   const earnedAmt = toAmount(earned);
@@ -43,6 +45,28 @@ function splitAvailableFromIncoming({ earned = 0, not_earned = 0 } = {}) {
     available_earned: earnedAmt,
     available_not_earned: notEarnedAmt,
     incoming: total,
+  };
+}
+
+/**
+ * Available total = earned income + previous month balance.
+ * not_earned incoming is reported but not included in available.total.
+ */
+function splitAvailableFromEarnedAndPrevious({
+  earned = 0,
+  not_earned = 0,
+  previous = 0,
+} = {}) {
+  const earnedAmt = toAmount(earned);
+  const notEarnedAmt = toAmount(not_earned);
+  const previousAmt = toAmount(previous);
+  const total = roundMoney(earnedAmt + previousAmt);
+  return {
+    total,
+    earned: earnedAmt,
+    not_earned: notEarnedAmt,
+    previous: previousAmt,
+    available: total,
   };
 }
 
@@ -72,5 +96,6 @@ module.exports = {
   calculatePaymentNet,
   calculatePaymentAmounts,
   splitAvailableFromIncoming,
+  splitAvailableFromEarnedAndPrevious,
   classifyPaymentTypeFlow,
 };

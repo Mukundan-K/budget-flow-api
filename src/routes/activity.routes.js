@@ -136,6 +136,7 @@ function mapExpense(row, splits = null, returnsByCategory = {}) {
     category: amounts.categories[0]?.category || row.category,
     categories: amounts.categories,
     is_split: amounts.is_split,
+    note: row.note || null,
     user_id: row.user_id,
     created_at: formatTimestamp(row.created_at) || row.created_at,
   };

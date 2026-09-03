@@ -249,6 +249,87 @@ router.get("/details", async (req, res) => {
   }
 });
 
+// All-time pending given/received per person (not month-filtered)
+// GET /api/debts/pending-by-person?user_id=1
+router.get("/pending-by-person", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) {
+      return badRequest(res, "user_id is required");
+    }
+
+    const debts = await db.query(
+      `${DEBT_SELECT}
+       WHERE d.user_id = $1
+       ORDER BY p.name ASC, d.id ASC`,
+      [user_id]
+    );
+
+    const byPerson = new Map();
+    debts.rows.map(mapDebt).forEach((debt) => {
+      const key = debt.person_id;
+      if (!byPerson.has(key)) {
+        byPerson.set(key, {
+          person_id: debt.person_id,
+          person_name: debt.person_name,
+          given_outstanding: 0,
+          received_outstanding: 0,
+        });
+      }
+      const row = byPerson.get(key);
+      if (debt.debt_type === "given") {
+        row.given_outstanding = addAmounts(row.given_outstanding, debt.outstanding);
+      } else {
+        row.received_outstanding = addAmounts(
+          row.received_outstanding,
+          debt.outstanding
+        );
+      }
+    });
+
+    const people = [...byPerson.values()]
+      .map((row) => {
+        const given_outstanding = formatAmount(row.given_outstanding);
+        const received_outstanding = formatAmount(row.received_outstanding);
+        return {
+          person_id: row.person_id,
+          person_name: row.person_name,
+          given_outstanding,
+          received_outstanding,
+          net: calculateDebtNet(given_outstanding, received_outstanding),
+          has_pending: given_outstanding > 0 || received_outstanding > 0,
+        };
+      })
+      .filter((row) => row.has_pending)
+      .sort(
+        (a, b) =>
+          Math.abs(b.net) - Math.abs(a.net) ||
+          String(a.person_name).localeCompare(String(b.person_name))
+      );
+
+    const given_outstanding = formatAmount(
+      addAmounts(...people.map((p) => p.given_outstanding))
+    );
+    const received_outstanding = formatAmount(
+      addAmounts(...people.map((p) => p.received_outstanding))
+    );
+
+    return success(
+      res,
+      {
+        given_outstanding,
+        received_outstanding,
+        debt_net: calculateDebtNet(given_outstanding, received_outstanding),
+        people,
+      },
+      "Pending debt by person fetched successfully"
+    );
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching pending debt by person");
+  }
+});
+
 // Create debt
 router.post("/", async (req, res) => {
   try {

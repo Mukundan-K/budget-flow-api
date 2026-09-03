@@ -22,9 +22,16 @@ const { calculateExpenseAmounts } = require("../services/financial");
 
 const VALID_FILTERS = new Set(["day", "month", "year"]);
 const AMOUNT_EPSILON = 1e-8;
+const NOTE_MAX_LENGTH = 500;
 
 function todayDate() {
   return parseTimestamp(new Date());
+}
+
+function normalizeNote(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text === "" ? null : text;
 }
 
 function amountsEqual(a, b) {
@@ -319,6 +326,7 @@ function mapExpense(row, splits = null, returnsByCategory = {}) {
     category: amounts.categories[0]?.category || row.category,
     categories: amounts.categories,
     is_split: amounts.is_split,
+    note: row.note || null,
     user_id: row.user_id,
     created_at: row.created_at,
   };
@@ -519,6 +527,14 @@ function validateExpensePayload(body, { partial = false } = {}) {
   if (expense_date !== undefined && expense_date !== null && expense_date !== "") {
     if (parseTimestamp(expense_date) === null) {
       errors.push("expense_date must be a valid date or timestamp");
+    }
+  }
+
+  if (body.note !== undefined && body.note !== null) {
+    if (typeof body.note !== "string") {
+      errors.push("note must be a string");
+    } else if (body.note.trim().length > NOTE_MAX_LENGTH) {
+      errors.push(`note must be at most ${NOTE_MAX_LENGTH} characters`);
     }
   }
 
@@ -763,15 +779,16 @@ router.post("/", async (req, res) => {
     const expense_date = parseTimestamp(req.body.expense_date) || todayDate();
     const category = resolved.primaryCategory;
     const user_id = req.body.user_id;
+    const note = normalizeNote(req.body.note);
 
     await client.query("BEGIN");
 
     const result = await client.query(
       `INSERT INTO expenses
-       (amount, expense_type, expense_date, category, user_id)
-       VALUES ($1, $2, $3, $4, $5)
+       (amount, expense_type, expense_date, category, user_id, note)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [amount, expense_type, expense_date, category, user_id]
+      [amount, expense_type, expense_date, category, user_id, note]
     );
 
     const expense = result.rows[0];
@@ -1061,6 +1078,7 @@ router.put("/:id", async (req, res) => {
     const expense_date = parseTimestamp(req.body.expense_date) || todayDate();
     const category = resolved.primaryCategory;
     const user_id = req.body.user_id;
+    const note = normalizeNote(req.body.note);
 
     await client.query("BEGIN");
 
@@ -1070,10 +1088,11 @@ router.put("/:id", async (req, res) => {
            expense_type = $2,
            expense_date = $3,
            category = $4,
-           user_id = $5
-       WHERE id = $6
+           user_id = $5,
+           note = $6
+       WHERE id = $7
        RETURNING *`,
-      [amount, expense_type, expense_date, category, user_id, req.params.id]
+      [amount, expense_type, expense_date, category, user_id, note, req.params.id]
     );
 
     if (result.rows.length === 0) {
@@ -1214,6 +1233,8 @@ router.patch("/:id", async (req, res) => {
         ? formatAmount(req.body.amount)
         : formatAmount(addAmounts(...splits.map((s) => s.amount)));
     const user_id = req.body.user_id ?? current.user_id;
+    const note =
+      req.body.note !== undefined ? normalizeNote(req.body.note) : current.note;
 
     await client.query("BEGIN");
 
@@ -1223,10 +1244,11 @@ router.patch("/:id", async (req, res) => {
            expense_type = $2,
            expense_date = $3,
            category = $4,
-           user_id = $5
-       WHERE id = $6
+           user_id = $5,
+           note = $6
+       WHERE id = $7
        RETURNING *`,
-      [totalAmount, expense_type, expense_date, primaryCategory, user_id, req.params.id]
+      [totalAmount, expense_type, expense_date, primaryCategory, user_id, note, req.params.id]
     );
 
     await replaceExpenseSplits(client, result.rows[0].id, splits);

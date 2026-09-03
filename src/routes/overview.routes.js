@@ -776,10 +776,10 @@ function buildMonthlyTrendChart(points) {
 
   const series = [
     {
-      name: "Income",
-      key: "income",
+      name: "Earned",
+      key: "earned",
       color: MONTHLY_TREND_COLORS.income,
-      data: points.map((p) => p.income),
+      data: points.map((p) => p.earned ?? p.income),
     },
     {
       name: "Spent",
@@ -794,7 +794,7 @@ function buildMonthlyTrendChart(points) {
       data: points.map((p) => p.from_savings),
     },
     {
-      name: "Debt",
+      name: "Net debt",
       key: "debt",
       color: MONTHLY_TREND_COLORS.debt,
       data: points.map((p) => p.debt),
@@ -1147,7 +1147,7 @@ async function buildMonthOverview(userId, year, month) {
         incoming: salary,
         earned,
         not_earned,
-        // Available = sum of all incoming; split earned vs not earned
+        // Available = earned + previous_month_balance
         available,
         available_split: monthly.available_split,
         spent: totalSpent,
@@ -1164,7 +1164,7 @@ async function buildMonthOverview(userId, year, month) {
 
 /**
  * Dashboard card payload — same month math as overview, clear labels for UI.
- * Available = sum of all incoming (flow=incoming), split earned / not_earned
+ * Available = earned + previous_month_balance
  * Spendable (total_amount_to_spend) = Incoming + Prev. balance
  * Total Spent = expenses (net) + outgoing payments (flow=outgoing)
  * Remaining  = Spendable − Total Spent − Savings − Debt
@@ -1287,6 +1287,8 @@ async function collectMonthlyTrendPoints(userId, year) {
       month: m,
       year: Number(year),
       income: overview.salary,
+      earned: overview.earned || 0,
+      not_earned: overview.not_earned || 0,
       spent: roundMoney(
         overview.expense_total + overview.outgoing_payments_total
       ),
@@ -1375,12 +1377,13 @@ async function buildDashboardForYear(userId, year) {
     }
   }
 
-  // Available = sum of all incoming (earned + not_earned)
-  const available = income;
+  // Available = earned + previous_month_balance
+  const available = roundMoney(earned + previous_balance);
   const available_split = {
     total: available,
     earned,
     not_earned,
+    previous: previous_balance,
   };
   const spent = roundMoney(expenseTotal + outgoingPayments);
   // Remaining = Incoming + Previous − Spent − Savings − Debt

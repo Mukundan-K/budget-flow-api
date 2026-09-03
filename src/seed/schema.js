@@ -58,6 +58,11 @@ async function seedSchema() {
     await migrateColumnToNumeric("expenses", "amount");
 
     await run(
+      "expenses.note",
+      `ALTER TABLE expenses ADD COLUMN IF NOT EXISTS note TEXT`
+    );
+
+    await run(
       "monthly_balances",
       `CREATE TABLE IF NOT EXISTS monthly_balances (
         id SERIAL PRIMARY KEY,

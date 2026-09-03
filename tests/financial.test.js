@@ -147,14 +147,14 @@ describe("monthly Remaining", () => {
       debt: 2000,
     });
     expect(result.remaining).toBe(33000);
-    // available = sum of incoming; spendable includes previous
-    expect(result.available).toBe(50000);
+    // available = earned (all incoming here) + previous
+    expect(result.available).toBe(70000);
     expect(result.total_amount_to_spend).toBe(70000);
     expect(result.debt).toBe(2000);
     expect(result.current_balance).toBe(33000);
   });
 
-  test("available splits earned vs not_earned", () => {
+  test("available is earned + previous, not including not_earned", () => {
     const result = calculateMonthlyBalance({
       earned: 40000,
       not_earned: 10000,
@@ -164,11 +164,12 @@ describe("monthly Remaining", () => {
       debt: 0,
     });
     expect(result.incoming).toBe(50000);
-    expect(result.available).toBe(50000);
+    expect(result.available).toBe(45000);
     expect(result.available_split).toEqual({
-      total: 50000,
+      total: 45000,
       earned: 40000,
       not_earned: 10000,
+      previous: 5000,
     });
     expect(result.earned).toBe(40000);
     expect(result.not_earned).toBe(10000);
