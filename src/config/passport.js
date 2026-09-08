@@ -7,11 +7,10 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "/auth/google/callback",
+      callbackURL: "https://budget-flow-api.onrender.com/auth/google/callback",
     },
     async (accessToken, refreshToken, profile, done) => {
       try {
-
         const email = profile.emails[0].value;
 
         let user = await pool.query(
@@ -20,7 +19,6 @@ passport.use(
         );
 
         if (user.rows.length === 0) {
-
           user = await pool.query(
             `
             INSERT INTO users
@@ -38,7 +36,6 @@ passport.use(
         }
 
         return done(null, user.rows[0]);
-
       } catch (err) {
         return done(err, null);
       }
