@@ -20,6 +20,9 @@ const {
   enrichEmiProduct,
   pct: sharePct,
 } = require("../services/financial");
+const {
+  getDebtMonthNetForMonth,
+} = require("../services/financial/debtMonth.service");
 
 function toAmount(value) {
   const amount = parseAmount(value);
@@ -889,75 +892,6 @@ async function getSavingsMonthNetForMonth(userId, year, month) {
   };
 }
 
-/** Debt month net for balance:
- * given_net − received_net
- * given_net     = given this month − returns on given this month
- * received_net  = received this month − repayments this month
- */
-async function getDebtMonthNetForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-
-  const given = await db.query(
-    `SELECT COALESCE(SUM(amount), 0) AS total
-     FROM debts
-     WHERE user_id = $1
-       AND debt_type = 'given'
-       AND debt_date >= $2
-       AND debt_date <= $3`,
-    [userId, start, end]
-  );
-
-  const givenReturns = await db.query(
-    `SELECT COALESCE(SUM(r.amount), 0) AS total
-     FROM debt_returns r
-     JOIN debts d ON d.id = r.debt_id
-     WHERE r.user_id = $1
-       AND d.debt_type = 'given'
-       AND r.return_date >= $2
-       AND r.return_date <= $3`,
-    [userId, start, end]
-  );
-
-  const received = await db.query(
-    `SELECT COALESCE(SUM(amount), 0) AS total
-     FROM debts
-     WHERE user_id = $1
-       AND debt_type = 'received'
-       AND debt_date >= $2
-       AND debt_date <= $3`,
-    [userId, start, end]
-  );
-
-  const receivedReturns = await db.query(
-    `SELECT COALESCE(SUM(r.amount), 0) AS total
-     FROM debt_returns r
-     JOIN debts d ON d.id = r.debt_id
-     WHERE r.user_id = $1
-       AND d.debt_type = 'received'
-       AND r.return_date >= $2
-       AND r.return_date <= $3`,
-    [userId, start, end]
-  );
-
-  const given_total = toAmount(given.rows[0].total);
-  const given_returned = toAmount(givenReturns.rows[0].total);
-  const received_total = toAmount(received.rows[0].total);
-  const received_returned = toAmount(receivedReturns.rows[0].total);
-  const given_net = roundMoney(given_total - given_returned);
-  const received_net = roundMoney(received_total - received_returned);
-
-  return {
-    given_total,
-    given_returned,
-    given_net,
-    received_total,
-    received_returned,
-    received_net,
-    // Positive = money out of pocket from debt activity this month
-    debt: roundMoney(given_net - received_net),
-  };
-}
-
 async function getLatestSalaryPayment(userId, year, month) {
   const { start, end } = monthRange(year, month);
   const result = await db.query(
@@ -1133,6 +1067,8 @@ async function buildMonthOverview(userId, year, month) {
         debt_given_returned: debtInfo.given_returned,
         debt_received_total: debtInfo.received_total,
         debt_received_returned: debtInfo.received_returned,
+        debt_received_repaid_this_month: debtInfo.received_repaid_this_month,
+        debt_received_repaid_past_months: debtInfo.received_repaid_past_months,
         total_amount_to_spend: totalAmountToSpend,
         total_spent: totalSpent,
         total_deductions: totalDeductions,
@@ -1267,6 +1203,11 @@ async function buildDashboard(userId, year, month, mode = "month") {
       outgoing_payments_total: overview.outgoing_payments_total,
       debt_given_net: overview.debt_given_net,
       debt_received_net: overview.debt_received_net,
+      debt_received_returned: overview.debt_received_returned,
+      debt_received_repaid_this_month:
+        overview.debt_received_repaid_this_month,
+      debt_received_repaid_past_months:
+        overview.debt_received_repaid_past_months,
       total_deductions: overview.total_deductions,
       dashboard_used_percentage:
         financial?.percentages?.dashboard_used_percentage ?? 0,

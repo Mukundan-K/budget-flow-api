@@ -100,6 +100,21 @@ describe("debt calculations", () => {
     });
     expect(summary.outstanding).toBe(12000);
     expect(summary.debt_net).toBe(4000);
+    expect(summary.received_repaid_this_month).toBe(0);
+    expect(summary.received_repaid_past_months).toBe(0);
+
+    const withRepay = calculateDebtSummary({
+      given_total: 10000,
+      given_returned: 2000,
+      received_total: 5000,
+      received_returned: 1000,
+      received_repaid_this_month: 400,
+      received_repaid_past_months: 600,
+    });
+    expect(withRepay.debt_net).toBe(4000);
+    expect(withRepay.received_returned).toBe(1000);
+    expect(withRepay.received_repaid_this_month).toBe(400);
+    expect(withRepay.received_repaid_past_months).toBe(600);
 
     const open = calculateDebtAmounts({ amount: 1000, returned_amount: 200 });
     expect(open.is_pending_zero).toBe(false);

@@ -49,6 +49,8 @@ function buildDashboardFinancialBlock(overview, extras = {}) {
     given_returned: overview.debt_given_returned,
     received_total: overview.debt_received_total,
     received_returned: overview.debt_received_returned,
+    received_repaid_this_month: overview.debt_received_repaid_this_month,
+    received_repaid_past_months: overview.debt_received_repaid_past_months,
   });
 
   return {
@@ -89,6 +91,9 @@ function buildDashboardFinancialBlock(overview, extras = {}) {
       debt_net: debts.debt_net,
       given_net: debts.given_net,
       received_net: debts.received_net,
+      received_returned: debts.received_returned,
+      received_repaid_this_month: debts.received_repaid_this_month,
+      received_repaid_past_months: debts.received_repaid_past_months,
     },
     percentages,
     summary,

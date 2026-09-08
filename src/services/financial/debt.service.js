@@ -38,6 +38,8 @@ function calculateDebtSummary({
   given_returned = 0,
   received_total = 0,
   received_returned = 0,
+  received_repaid_this_month = 0,
+  received_repaid_past_months = 0,
 } = {}) {
   const given_outstanding = calculateDebtOutstanding(given_total, given_returned);
   const received_outstanding = calculateDebtOutstanding(
@@ -50,6 +52,8 @@ function calculateDebtSummary({
     toAmount(given_returned) + toAmount(received_returned)
   );
   const outstanding = roundMoney(given_outstanding + received_outstanding);
+  const repaid_this_month = toAmount(received_repaid_this_month);
+  const repaid_past_months = toAmount(received_repaid_past_months);
 
   return {
     given_total: toAmount(given_total),
@@ -60,6 +64,8 @@ function calculateDebtSummary({
     received_returned: toAmount(received_returned),
     received_outstanding,
     received_net: received_outstanding,
+    received_repaid_this_month: repaid_this_month,
+    received_repaid_past_months: repaid_past_months,
     total,
     returned,
     outstanding,

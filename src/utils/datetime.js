@@ -182,6 +182,11 @@ function monthRangeTimestamps(year, month) {
   };
 }
 
+function previousMonth(year, month) {
+  if (month === 1) return { year: year - 1, month: 12 };
+  return { year, month: month - 1 };
+}
+
 module.exports = {
   APP_TIMEZONE,
   nowTimestamp,
@@ -190,6 +195,7 @@ module.exports = {
   dayStart,
   dayEnd,
   monthRangeTimestamps,
+  previousMonth,
   toDateObject,
   getZonedCalendarParts,
 };

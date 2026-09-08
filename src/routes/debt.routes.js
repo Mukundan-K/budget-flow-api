@@ -17,7 +17,15 @@ const {
   dayEnd,
   monthRangeTimestamps,
 } = require("../utils/datetime");
-const { calculateDebtAmounts, calculateDebtNet } = require("../services/financial");
+const {
+  calculateDebtAmounts,
+  calculateDebtNet,
+  calculateDebtSummary,
+} = require("../services/financial");
+const {
+  getDebtMonthNetForMonth,
+  toDebtOverview,
+} = require("../services/financial/debtMonth.service");
 
 /**
  * debt_type:
@@ -201,25 +209,39 @@ router.get("/details", async (req, res) => {
     );
 
     const mapped = debts.rows.map(mapDebt);
-    const given = mapped.filter((d) => d.debt_type === "given");
-    const received = mapped.filter((d) => d.debt_type === "received");
+    const givenItems = mapped.filter((d) => d.debt_type === "given");
+    const receivedItems = mapped.filter((d) => d.debt_type === "received");
 
-    const sumNet = (rows) =>
-      formatAmount(addAmounts(...rows.map((d) => d.net_amount)));
-    const sumAmount = (rows) =>
-      formatAmount(addAmounts(...rows.map((d) => d.amount)));
-    const sumReturned = (rows) =>
-      formatAmount(addAmounts(...rows.map((d) => d.returned_amount)));
+    let summary;
+    if (filterMonth != null && filterYear != null) {
+      // Same month activity as dashboard remaining balance
+      const monthNet = await getDebtMonthNetForMonth(
+        user_id,
+        filterYear,
+        filterMonth
+      );
+      summary = calculateDebtSummary({
+        given_total: monthNet.given_total,
+        given_returned: monthNet.given_returned,
+        received_total: monthNet.received_total,
+        received_returned: monthNet.received_returned,
+        received_repaid_this_month: monthNet.received_repaid_this_month,
+        received_repaid_past_months: monthNet.received_repaid_past_months,
+      });
+    } else {
+      const sumAmount = (rows) =>
+        formatAmount(addAmounts(...rows.map((d) => d.amount)));
+      const sumReturned = (rows) =>
+        formatAmount(addAmounts(...rows.map((d) => d.returned_amount)));
+      summary = calculateDebtSummary({
+        given_total: sumAmount(givenItems),
+        given_returned: sumReturned(givenItems),
+        received_total: sumAmount(receivedItems),
+        received_returned: sumReturned(receivedItems),
+      });
+    }
 
-    const given_total = sumAmount(given);
-    const given_returned = sumReturned(given);
-    const given_outstanding = sumNet(given);
-    const received_total = sumAmount(received);
-    const received_returned = sumReturned(received);
-    const received_outstanding = sumNet(received);
-
-    // Net debt for balance: given outstanding − received outstanding
-    const debt_net = calculateDebtNet(given_outstanding, received_outstanding);
+    const debt_net = summary.debt_net;
 
     return success(
       res,
@@ -228,17 +250,18 @@ router.get("/details", async (req, res) => {
         year: filterYear,
         debt: debt_net,
         debt_net,
+        overview: toDebtOverview(summary),
         given: {
-          total: given_total,
-          returned: given_returned,
-          outstanding: given_outstanding,
-          items: given,
+          total: summary.given_total,
+          returned: summary.given_returned,
+          outstanding: summary.given_outstanding,
+          items: givenItems,
         },
         received: {
-          total: received_total,
-          returned: received_returned,
-          outstanding: received_outstanding,
-          items: received,
+          total: summary.received_total,
+          returned: summary.received_returned,
+          outstanding: summary.received_outstanding,
+          items: receivedItems,
         },
       },
       "Debt details fetched successfully"

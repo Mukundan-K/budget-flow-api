@@ -6,6 +6,8 @@ const passport = require("passport");
 
 dotenv.config();
 
+const PORT = process.env.PORT || 5000;
+
 require("./config/passport");
 
 const authRoutes = require("./routes/auth");
@@ -67,7 +69,7 @@ seedSchema()
   )
   .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))
   .then(() => {
-    app.listen(process.env.PORT, () => {
-      console.log(`Server running on http://localhost:${process.env.PORT}`);
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
     });
   });
