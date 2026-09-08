@@ -57,19 +57,21 @@ app.use("/api/debts", debtRoutes);
 app.use("/api/persons", personRoutes);
 app.use("/api/activities", activityRoutes);
 
-// Schema first (users/expenses/monthly_balances), then feature tables
-seedSchema()
-  .then(() =>
-    Promise.all([
-      seedDefaultCategories(),
-      seedPayments(),
-      seedSavings(),
-      seedDebts(),
-    ])
-  )
-  .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+
+  // Schema first (users/expenses/monthly_balances), then feature tables
+  seedSchema()
+    .then(() =>
+      Promise.all([
+        seedDefaultCategories(),
+        seedPayments(),
+        seedSavings(),
+        seedDebts(),
+      ])
+    )
+    .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))
+    .catch((err) => {
+      console.error("Database seed failed:", err);
     });
-  });
+});
