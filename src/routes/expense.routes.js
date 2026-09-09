@@ -19,6 +19,10 @@ const {
   monthRangeTimestamps,
 } = require("../utils/datetime");
 const { calculateExpenseAmounts } = require("../services/financial");
+const {
+  yearMonthFromTimestamp,
+  rebuildAffectedMonthlyFinancialSummaries,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 const VALID_FILTERS = new Set(["day", "month", "year"]);
 const AMOUNT_EPSILON = 1e-8;
@@ -440,6 +444,58 @@ async function replaceExpenseSplits(client, expenseId, splits) {
   );
 }
 
+function expenseSummaryTarget(expense) {
+  const ym = yearMonthFromTimestamp(expense.expense_date);
+  return {
+    user_id: expense.user_id,
+    year: ym.year,
+    month: ym.month,
+  };
+}
+
+function expenseHeaderAffectsSummary(oldExpense, newExpense) {
+  const oldTarget = expenseSummaryTarget(oldExpense);
+  const newTarget = expenseSummaryTarget(newExpense);
+  return (
+    Number(oldTarget.user_id) !== Number(newTarget.user_id) ||
+    oldTarget.year !== newTarget.year ||
+    oldTarget.month !== newTarget.month ||
+    !amountsEqual(toAmount(oldExpense.amount), toAmount(newExpense.amount))
+  );
+}
+
+async function getExpenseReturnSnapshot(client, expenseId) {
+  const result = await client.query(
+    `SELECT COUNT(*)::int AS n, COALESCE(SUM(amount), 0) AS total
+     FROM expense_returns
+     WHERE expense_id = $1`,
+    [expenseId]
+  );
+  return {
+    n: Number(result.rows[0].n) || 0,
+    total: toAmount(result.rows[0].total),
+  };
+}
+
+function expenseReturnsChanged(before, after) {
+  return before.n !== after.n || !amountsEqual(before.total, after.total);
+}
+
+async function maybeRebuildExpenseSummary(
+  client,
+  oldExpense,
+  newExpense,
+  returnsChanged
+) {
+  if (!expenseHeaderAffectsSummary(oldExpense, newExpense) && !returnsChanged) {
+    return;
+  }
+  await rebuildAffectedMonthlyFinancialSummaries(
+    [expenseSummaryTarget(oldExpense), expenseSummaryTarget(newExpense)],
+    client
+  );
+}
+
 /**
  * Resolve inclusive date range from filter + selectors.
  */
@@ -793,6 +849,10 @@ router.post("/", async (req, res) => {
 
     const expense = result.rows[0];
     await replaceExpenseSplits(client, expense.id, resolved.splits);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [expenseSummaryTarget(expense)],
+      client
+    );
     await client.query("COMMIT");
 
     const [mapped] = await mapExpensesWithSplits([expense]);
@@ -967,27 +1027,47 @@ router.post("/:id/returns", async (req, res) => {
     }
     const return_date = parseTimestamp(req.body.date) || todayDate();
 
-    const inserted = await db.query(
-      `INSERT INTO expense_returns
-         (expense_id, category, user_id, amount, return_date)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [req.params.id, split.category, user_id, amount, return_date]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO expense_returns
+           (expense_id, category, user_id, amount, return_date)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *`,
+        [req.params.id, split.category, user_id, amount, return_date]
+      );
 
-    const refreshed = await db.query(`SELECT * FROM expenses WHERE id = $1`, [
-      req.params.id,
-    ]);
-    const [updatedExpense] = await mapExpensesWithSplits(refreshed.rows);
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [expenseSummaryTarget(result.rows[0])],
+        client
+      );
 
-    return created(
-      res,
-      {
-        return: mapExpenseReturn(inserted.rows[0]),
-        expense: updatedExpense,
-      },
-      "Expense return added successfully"
-    );
+      const refreshed = await client.query(
+        `SELECT * FROM expenses WHERE id = $1`,
+        [req.params.id]
+      );
+      await client.query("COMMIT");
+
+      const [updatedExpense] = await mapExpensesWithSplits(refreshed.rows);
+      return created(
+        res,
+        {
+          return: mapExpenseReturn(inserted.rows[0]),
+          expense: updatedExpense,
+        },
+        "Expense return added successfully"
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error adding expense return");
@@ -996,8 +1076,19 @@ router.post("/:id/returns", async (req, res) => {
 
 // Delete an expense return
 router.delete("/:id/returns/:returnId", async (req, res) => {
+  const client = await db.connect();
   try {
-    const result = await db.query(
+    await client.query("BEGIN");
+    const expenseRows = await client.query(
+      `SELECT * FROM expenses WHERE id = $1`,
+      [req.params.id]
+    );
+    if (expenseRows.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return notFound(res, "Expense not found");
+    }
+
+    const result = await client.query(
       `DELETE FROM expense_returns
        WHERE id = $1 AND expense_id = $2
        RETURNING *`,
@@ -1005,16 +1096,17 @@ router.delete("/:id/returns/:returnId", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Expense return not found");
     }
 
-    const expenseRows = await db.query(`SELECT * FROM expenses WHERE id = $1`, [
-      req.params.id,
-    ]);
-    const [expense] = expenseRows.rows.length
-      ? await mapExpensesWithSplits(expenseRows.rows)
-      : [null];
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [expenseSummaryTarget(expenseRows.rows[0])],
+      client
+    );
+    await client.query("COMMIT");
 
+    const [expense] = await mapExpensesWithSplits(expenseRows.rows);
     return success(
       res,
       {
@@ -1024,8 +1116,15 @@ router.delete("/:id/returns/:returnId", async (req, res) => {
       "Expense return deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting expense return");
+  } finally {
+    client.release();
   }
 });
 
@@ -1082,6 +1181,17 @@ router.put("/:id", async (req, res) => {
 
     await client.query("BEGIN");
 
+    const existing = await client.query(
+      `SELECT * FROM expenses WHERE id = $1`,
+      [req.params.id]
+    );
+    if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return notFound(res, "Expense not found");
+    }
+
+    const returnsBefore = await getExpenseReturnSnapshot(client, req.params.id);
+
     const result = await client.query(
       `UPDATE expenses
        SET amount = $1,
@@ -1095,12 +1205,14 @@ router.put("/:id", async (req, res) => {
       [amount, expense_type, expense_date, category, user_id, note, req.params.id]
     );
 
-    if (result.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return notFound(res, "Expense not found");
-    }
-
     await replaceExpenseSplits(client, result.rows[0].id, resolved.splits);
+    const returnsAfter = await getExpenseReturnSnapshot(client, req.params.id);
+    await maybeRebuildExpenseSummary(
+      client,
+      existing.rows[0],
+      result.rows[0],
+      expenseReturnsChanged(returnsBefore, returnsAfter)
+    );
     await client.query("COMMIT");
 
     const [mapped] = await mapExpensesWithSplits(result.rows);
@@ -1238,6 +1350,16 @@ router.patch("/:id", async (req, res) => {
 
     await client.query("BEGIN");
 
+    const locked = await client.query(`SELECT * FROM expenses WHERE id = $1`, [
+      req.params.id,
+    ]);
+    if (locked.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return notFound(res, "Expense not found");
+    }
+
+    const returnsBefore = await getExpenseReturnSnapshot(client, req.params.id);
+
     const result = await client.query(
       `UPDATE expenses
        SET amount = $1,
@@ -1252,6 +1374,13 @@ router.patch("/:id", async (req, res) => {
     );
 
     await replaceExpenseSplits(client, result.rows[0].id, splits);
+    const returnsAfter = await getExpenseReturnSnapshot(client, req.params.id);
+    await maybeRebuildExpenseSummary(
+      client,
+      locked.rows[0],
+      result.rows[0],
+      expenseReturnsChanged(returnsBefore, returnsAfter)
+    );
     await client.query("COMMIT");
 
     const [mapped] = await mapExpensesWithSplits(result.rows);
@@ -1267,22 +1396,37 @@ router.patch("/:id", async (req, res) => {
 
 // Delete expense — 200
 router.delete("/:id", async (req, res) => {
+  const client = await db.connect();
   try {
-    const existing = await db.query(`SELECT * FROM expenses WHERE id = $1`, [
+    await client.query("BEGIN");
+    const existing = await client.query(`SELECT * FROM expenses WHERE id = $1`, [
       req.params.id,
     ]);
     if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Expense not found");
     }
 
     const [mapped] = await mapExpensesWithSplits(existing.rows);
 
-    await db.query(`DELETE FROM expenses WHERE id = $1`, [req.params.id]);
+    await client.query(`DELETE FROM expenses WHERE id = $1`, [req.params.id]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [expenseSummaryTarget(existing.rows[0])],
+      client
+    );
+    await client.query("COMMIT");
 
     return success(res, mapped, "Expense deleted successfully");
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting expense");
+  } finally {
+    client.release();
   }
 });
 

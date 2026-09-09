@@ -6,7 +6,12 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "jest"
+    "test": "jest",
+    "backfill:monthly-summary": "node scripts/backfill-monthly-financial-summary.js",
+    "repair:monthly-summary": "node scripts/repair-monthly-financial-summary.js",
+    "compare:monthly-summary": "node scripts/compare-monthly-financial-summary.js",
+    "compare:month-overview": "node scripts/compare-month-overview.js",
+    "measure:dashboard": "node scripts/measure-dashboard.js"
   },
   "repository": {
     "type": "git",

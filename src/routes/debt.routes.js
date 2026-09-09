@@ -26,6 +26,10 @@ const {
   getDebtMonthNetForMonth,
   toDebtOverview,
 } = require("../services/financial/debtMonth.service");
+const {
+  yearMonthFromTimestamp,
+  rebuildAffectedMonthlyFinancialSummaries,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 /**
  * debt_type:
@@ -103,6 +107,37 @@ const DEBT_SELECT = `
     GROUP BY debt_id
   ) ret ON ret.debt_id = d.id
 `;
+
+function debtOriginSummaryTarget(debt) {
+  const ym = yearMonthFromTimestamp(debt.debt_date);
+  return {
+    user_id: debt.user_id,
+    year: ym.year,
+    month: ym.month,
+  };
+}
+
+function debtReturnSummaryTarget(ret) {
+  const ym = yearMonthFromTimestamp(ret.return_date);
+  return {
+    user_id: ret.user_id,
+    year: ym.year,
+    month: ym.month,
+  };
+}
+
+async function fetchDebtReturns(client, debtId) {
+  const result = await client.query(
+    `SELECT id, user_id, return_date FROM debt_returns WHERE debt_id = $1`,
+    [debtId]
+  );
+  return result.rows;
+}
+
+async function fetchMappedDebt(client, debtId) {
+  const result = await client.query(`${DEBT_SELECT} WHERE d.id = $1`, [debtId]);
+  return result.rows[0] ? mapDebt(result.rows[0]) : null;
+}
 
 function validatePayload(body, { partial = false } = {}) {
   const errors = [];
@@ -372,18 +407,34 @@ router.post("/", async (req, res) => {
       return badRequest(res, personCheck.error);
     }
 
-    const inserted = await db.query(
-      `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [user_id, person_id, amount, debt_type, debt_date]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, user_id, debt_date`,
+        [user_id, person_id, amount, debt_type, debt_date]
+      );
 
-    const result = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      inserted.rows[0].id,
-    ]);
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [debtOriginSummaryTarget(inserted.rows[0])],
+        client
+      );
 
-    return created(res, mapDebt(result.rows[0]), "Debt created successfully");
+      const mapped = await fetchMappedDebt(client, inserted.rows[0].id);
+      await client.query("COMMIT");
+      return created(res, mapped, "Debt created successfully");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error creating debt");
@@ -528,25 +579,41 @@ router.post("/:id/returns", async (req, res) => {
       );
     }
 
-    const inserted = await db.query(
-      `INSERT INTO debt_returns (debt_id, user_id, amount, return_date)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [req.params.id, user_id, amount, return_date]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO debt_returns (debt_id, user_id, amount, return_date)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [req.params.id, user_id, amount, return_date]
+      );
 
-    const updated = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      req.params.id,
-    ]);
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [debtReturnSummaryTarget(inserted.rows[0])],
+        client
+      );
 
-    return created(
-      res,
-      {
-        return: mapDebtReturn(inserted.rows[0]),
-        debt: mapDebt(updated.rows[0]),
-      },
-      "Debt return added successfully"
-    );
+      const mappedDebt = await fetchMappedDebt(client, req.params.id);
+      await client.query("COMMIT");
+      return created(
+        res,
+        {
+          return: mapDebtReturn(inserted.rows[0]),
+          debt: mappedDebt,
+        },
+        "Debt return added successfully"
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error adding debt return");
@@ -555,32 +622,45 @@ router.post("/:id/returns", async (req, res) => {
 
 // Delete return
 router.delete("/:id/returns/:returnId", async (req, res) => {
+  const client = await db.connect();
   try {
-    const result = await db.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `DELETE FROM debt_returns
        WHERE id = $1 AND debt_id = $2
        RETURNING *`,
       [req.params.returnId, req.params.id]
     );
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Debt return not found");
     }
 
-    const debt = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      req.params.id,
-    ]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [debtReturnSummaryTarget(result.rows[0])],
+      client
+    );
 
+    const mappedDebt = await fetchMappedDebt(client, req.params.id);
+    await client.query("COMMIT");
     return success(
       res,
       {
         return: mapDebtReturn(result.rows[0]),
-        debt: debt.rows[0] ? mapDebt(debt.rows[0]) : null,
+        debt: mappedDebt,
       },
       "Debt return deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting debt return");
+  } finally {
+    client.release();
   }
 });
 
@@ -668,22 +748,54 @@ async function updateDebt(req, res, { partial = false } = {}) {
       );
     }
 
-    await db.query(
-      `UPDATE debts
-       SET user_id = $1,
-           person_id = $2,
-           amount = $3,
-           debt_type = $4,
-           debt_date = $5
-       WHERE id = $6`,
-      [user_id, person_id, amount, debt_type, debt_date, req.params.id]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(
+        `SELECT id, user_id, debt_date, debt_type FROM debts WHERE id = $1`,
+        [req.params.id]
+      );
+      if (locked.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return notFound(res, "Debt not found");
+      }
 
-    const result = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      req.params.id,
-    ]);
+      const returns =
+        locked.rows[0].debt_type !== debt_type
+          ? await fetchDebtReturns(client, req.params.id)
+          : [];
 
-    return success(res, mapDebt(result.rows[0]), "Debt updated successfully");
+      await client.query(
+        `UPDATE debts
+         SET user_id = $1,
+             person_id = $2,
+             amount = $3,
+             debt_type = $4,
+             debt_date = $5
+         WHERE id = $6`,
+        [user_id, person_id, amount, debt_type, debt_date, req.params.id]
+      );
+
+      const targets = [
+        debtOriginSummaryTarget(locked.rows[0]),
+        debtOriginSummaryTarget({ user_id, debt_date }),
+        ...returns.map(debtReturnSummaryTarget),
+      ];
+      await rebuildAffectedMonthlyFinancialSummaries(targets, client);
+
+      const mapped = await fetchMappedDebt(client, req.params.id);
+      await client.query("COMMIT");
+      return success(res, mapped, "Debt updated successfully");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error updating debt");
@@ -695,15 +807,28 @@ router.patch("/:id", (req, res) => updateDebt(req, res, { partial: true }));
 
 // Delete debt
 router.delete("/:id", async (req, res) => {
+  const client = await db.connect();
   try {
-    const existing = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
+    await client.query("BEGIN");
+    const existing = await client.query(`${DEBT_SELECT} WHERE d.id = $1`, [
       req.params.id,
     ]);
     if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Debt not found");
     }
 
-    await db.query(`DELETE FROM debts WHERE id = $1`, [req.params.id]);
+    const returns = await fetchDebtReturns(client, req.params.id);
+
+    await client.query(`DELETE FROM debts WHERE id = $1`, [req.params.id]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [
+        debtOriginSummaryTarget(existing.rows[0]),
+        ...returns.map(debtReturnSummaryTarget),
+      ],
+      client
+    );
+    await client.query("COMMIT");
 
     return success(
       res,
@@ -711,8 +836,15 @@ router.delete("/:id", async (req, res) => {
       "Debt deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting debt");
+  } finally {
+    client.release();
   }
 });
 

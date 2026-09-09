@@ -13,10 +13,10 @@ const { calculateDebtSummary } = require("./debt.service");
  * received_repaid_this_month   = repayments this month on received debts from this month
  * received_repaid_past_months  = repayments this month on received debts from any past month
  */
-async function getDebtMonthNetForMonth(userId, year, month) {
+async function getDebtMonthNetForMonth(userId, year, month, client = db) {
   const { start, end } = monthRangeTimestamps(year, month);
 
-  const originated = await db.query(
+  const originated = await client.query(
     `SELECT
        COALESCE(SUM(CASE WHEN debt_type = 'given' THEN amount ELSE 0 END), 0) AS given_total,
        COALESCE(SUM(CASE WHEN debt_type = 'received' THEN amount ELSE 0 END), 0) AS received_total
@@ -27,7 +27,7 @@ async function getDebtMonthNetForMonth(userId, year, month) {
     [userId, start, end]
   );
 
-  const returns = await db.query(
+  const returns = await client.query(
     `SELECT
        COALESCE(SUM(CASE WHEN d.debt_type = 'given' AND r.return_date >= $2 AND r.return_date <= $3 THEN r.amount ELSE 0 END), 0) AS given_returned,
        COALESCE(SUM(CASE WHEN d.debt_type = 'received' AND r.return_date >= $2 AND r.return_date <= $3 THEN r.amount ELSE 0 END), 0) AS received_returned,

@@ -9,6 +9,10 @@ const {
   conflict,
   serverError,
 } = require("../utils/response");
+const {
+  yearMonthFromTimestamp,
+  rebuildAffectedMonthlyFinancialSummaries,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 /**
  * Payment types store name, flow, and is_income as independent fields:
@@ -144,6 +148,86 @@ function resolveFieldsFromBody(body, current = null) {
   return { name, flow, is_income };
 }
 
+function normalizedFlow(row) {
+  return FLOW_VALUES.has(row.flow)
+    ? row.flow
+    : Boolean(row.is_income)
+      ? "incoming"
+      : "outgoing";
+}
+
+function paymentTypeClassificationChanged(existing, nextFields) {
+  return (
+    normalizedFlow(existing) !== nextFields.flow ||
+    Boolean(existing.is_income) !== Boolean(nextFields.is_income)
+  );
+}
+
+async function loadPaymentTypeSummaryTargets(client, paymentTypeId) {
+  const result = await client.query(
+    `SELECT user_id, payment_date
+     FROM payments
+     WHERE payment_type_id = $1`,
+    [paymentTypeId]
+  );
+
+  return result.rows.map((row) => {
+    const ym = yearMonthFromTimestamp(row.payment_date);
+    if (!ym) return null;
+    return { user_id: row.user_id, year: ym.year, month: ym.month };
+  });
+}
+
+async function updatePaymentTypeWithSummarySync(id, fields) {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const existingResult = await client.query(
+      `SELECT ${SELECT_COLS}
+       FROM payment_types
+       WHERE id = $1`,
+      [id]
+    );
+    if (existingResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return { notFound: true };
+    }
+
+    const classificationChanged = paymentTypeClassificationChanged(
+      existingResult.rows[0],
+      fields
+    );
+    const targets = classificationChanged
+      ? await loadPaymentTypeSummaryTargets(client, id)
+      : [];
+
+    const result = await client.query(
+      `UPDATE payment_types
+       SET name = $1, flow = $2, is_income = $3
+       WHERE id = $4
+       RETURNING ${SELECT_COLS}`,
+      [fields.name, fields.flow, fields.is_income, id]
+    );
+
+    if (classificationChanged) {
+      await rebuildAffectedMonthlyFinancialSummaries(targets, client);
+    }
+
+    await client.query("COMMIT");
+    return { row: result.rows[0] };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 const SELECT_COLS = `id, name, flow, is_income, created_at`;
 
 // Create payment type
@@ -263,21 +347,18 @@ router.put("/:id", async (req, res) => {
       return badRequest(res, "Invalid flow or is_income");
     }
 
-    const result = await db.query(
-      `UPDATE payment_types
-       SET name = $1, flow = $2, is_income = $3
-       WHERE id = $4
-       RETURNING ${SELECT_COLS}`,
-      [name, flow, is_income, req.params.id]
-    );
-
-    if (result.rows.length === 0) {
+    const updated = await updatePaymentTypeWithSummarySync(req.params.id, {
+      name,
+      flow,
+      is_income,
+    });
+    if (updated.notFound) {
       return notFound(res, "Payment type not found");
     }
 
     return success(
       res,
-      mapPaymentType(result.rows[0]),
+      mapPaymentType(updated.row),
       "Payment type updated successfully"
     );
   } catch (err) {
@@ -315,17 +396,18 @@ router.patch("/:id", async (req, res) => {
       return badRequest(res, "Invalid flow or is_income");
     }
 
-    const result = await db.query(
-      `UPDATE payment_types
-       SET name = $1, flow = $2, is_income = $3
-       WHERE id = $4
-       RETURNING ${SELECT_COLS}`,
-      [name, flow, is_income, req.params.id]
-    );
+    const updated = await updatePaymentTypeWithSummarySync(req.params.id, {
+      name,
+      flow,
+      is_income,
+    });
+    if (updated.notFound) {
+      return notFound(res, "Payment type not found");
+    }
 
     return success(
       res,
-      mapPaymentType(result.rows[0]),
+      mapPaymentType(updated.row),
       "Payment type updated successfully"
     );
   } catch (err) {
@@ -357,7 +439,7 @@ router.delete("/:id", async (req, res) => {
       "Payment type deleted successfully"
     );
   } catch (err) {
-    if (err.code === "23503") {
+    if (err.code === "23503" || err.code === "23001") {
       return conflict(res, "Cannot delete payment type that is used by payments");
     }
     console.error(err);

@@ -24,6 +24,10 @@ const {
   calculatePaymentAmounts,
   enrichEmiProduct,
 } = require("../services/financial");
+const {
+  yearMonthFromTimestamp,
+  rebuildAffectedMonthlyFinancialSummaries,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 const VALID_FILTERS = new Set(["day", "month", "year"]);
 
@@ -319,6 +323,22 @@ const PAYMENT_SELECT = `
   ) ret ON ret.payment_id = p.id
 `;
 
+function paymentSummaryTarget(payment) {
+  const ym = yearMonthFromTimestamp(payment.payment_date);
+  return {
+    user_id: payment.user_id,
+    year: ym.year,
+    month: ym.month,
+  };
+}
+
+async function fetchMappedPayment(client, paymentId) {
+  const result = await client.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+    paymentId,
+  ]);
+  return result.rows[0] ? mapPayment(result.rows[0]) : null;
+}
+
 // Create payment (salary, rent, EMI, etc.)
 router.post("/", async (req, res) => {
   try {
@@ -359,24 +379,35 @@ router.post("/", async (req, res) => {
     const payment_type_id = req.body.payment_type_id;
     const payment_date = parseTimestamp(req.body.date) || nowTimestamp();
 
-    const result = await db.query(
-      `INSERT INTO payments
-         (amount, payment_date, user_id, payment_type_id, emi_product_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [amount, payment_date, user_id, payment_type_id, emi_product_id]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `INSERT INTO payments
+           (amount, payment_date, user_id, payment_type_id, emi_product_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, payment_date, user_id`,
+        [amount, payment_date, user_id, payment_type_id, emi_product_id]
+      );
 
-    const createdPayment = await db.query(
-      `${PAYMENT_SELECT} WHERE p.id = $1`,
-      [result.rows[0].id]
-    );
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [paymentSummaryTarget(result.rows[0])],
+        client
+      );
 
-    return created(
-      res,
-      mapPayment(createdPayment.rows[0]),
-      "Payment added successfully"
-    );
+      const mapped = await fetchMappedPayment(client, result.rows[0].id);
+      await client.query("COMMIT");
+      return created(res, mapped, "Payment added successfully");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error adding payment");
@@ -496,25 +527,41 @@ router.post("/:id/returns", async (req, res) => {
     const return_date = parseTimestamp(req.body.date) || nowTimestamp();
 
     // Returns may exceed the original payment (over-refund); net_amount can be negative.
-    const inserted = await db.query(
-      `INSERT INTO payment_returns (payment_id, user_id, amount, return_date)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [req.params.id, user_id, amount, return_date]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO payment_returns (payment_id, user_id, amount, return_date)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [req.params.id, user_id, amount, return_date]
+      );
 
-    const updatedPayment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
-      req.params.id,
-    ]);
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [paymentSummaryTarget(payment.rows[0])],
+        client
+      );
 
-    return created(
-      res,
-      {
-        return: mapPaymentReturn(inserted.rows[0]),
-        payment: mapPayment(updatedPayment.rows[0]),
-      },
-      "Payment return added successfully"
-    );
+      const mappedPayment = await fetchMappedPayment(client, req.params.id);
+      await client.query("COMMIT");
+      return created(
+        res,
+        {
+          return: mapPaymentReturn(inserted.rows[0]),
+          payment: mappedPayment,
+        },
+        "Payment return added successfully"
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error adding payment return");
@@ -523,8 +570,18 @@ router.post("/:id/returns", async (req, res) => {
 
 // Delete a payment return
 router.delete("/:id/returns/:returnId", async (req, res) => {
+  const client = await db.connect();
   try {
-    const result = await db.query(
+    await client.query("BEGIN");
+    const payment = await client.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
+    if (payment.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return notFound(res, "Payment not found");
+    }
+
+    const result = await client.query(
       `DELETE FROM payment_returns
        WHERE id = $1 AND payment_id = $2
        RETURNING *`,
@@ -532,24 +589,35 @@ router.delete("/:id/returns/:returnId", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Payment return not found");
     }
 
-    const payment = await db.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
-      req.params.id,
-    ]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [paymentSummaryTarget(payment.rows[0])],
+      client
+    );
 
+    const mappedPayment = await fetchMappedPayment(client, req.params.id);
+    await client.query("COMMIT");
     return success(
       res,
       {
         return: mapPaymentReturn(result.rows[0]),
-        payment: payment.rows[0] ? mapPayment(payment.rows[0]) : null,
+        payment: mappedPayment,
       },
       "Payment return deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting payment return");
+  } finally {
+    client.release();
   }
 });
 
@@ -626,28 +694,57 @@ router.put("/:id", async (req, res) => {
     const payment_type_id = req.body.payment_type_id;
     const payment_date = parseTimestamp(req.body.date) || nowTimestamp();
 
-    const result = await db.query(
-      `UPDATE payments
-       SET amount = $1,
-           payment_date = $2,
-           user_id = $3,
-           payment_type_id = $4,
-           emi_product_id = $5
-       WHERE id = $6
-       RETURNING id`,
-      [amount, payment_date, user_id, payment_type_id, emi_product_id, req.params.id]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query(
+        `SELECT id, payment_date, user_id FROM payments WHERE id = $1`,
+        [req.params.id]
+      );
+      if (existing.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return notFound(res, "Payment not found");
+      }
 
-    if (result.rows.length === 0) {
-      return notFound(res, "Payment not found");
+      await client.query(
+        `UPDATE payments
+         SET amount = $1,
+             payment_date = $2,
+             user_id = $3,
+             payment_type_id = $4,
+             emi_product_id = $5
+         WHERE id = $6`,
+        [
+          amount,
+          payment_date,
+          user_id,
+          payment_type_id,
+          emi_product_id,
+          req.params.id,
+        ]
+      );
+
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [
+          paymentSummaryTarget(existing.rows[0]),
+          paymentSummaryTarget({ payment_date, user_id }),
+        ],
+        client
+      );
+
+      const mapped = await fetchMappedPayment(client, req.params.id);
+      await client.query("COMMIT");
+      return success(res, mapped, "Payment updated successfully");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
     }
-
-    const updated = await db.query(
-      `${PAYMENT_SELECT} WHERE p.id = $1`,
-      [req.params.id]
-    );
-
-    return success(res, mapPayment(updated.rows[0]), "Payment updated successfully");
   } catch (err) {
     console.error(err);
     return serverError(res, "Error updating payment");
@@ -710,23 +807,57 @@ router.patch("/:id", async (req, res) => {
       emi_product_id = null;
     }
 
-    await db.query(
-      `UPDATE payments
-       SET amount = $1,
-           payment_date = $2,
-           user_id = $3,
-           payment_type_id = $4,
-           emi_product_id = $5
-       WHERE id = $6`,
-      [amount, payment_date, user_id, payment_type_id, emi_product_id, req.params.id]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(
+        `SELECT id, payment_date, user_id FROM payments WHERE id = $1`,
+        [req.params.id]
+      );
+      if (locked.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return notFound(res, "Payment not found");
+      }
 
-    const updated = await db.query(
-      `${PAYMENT_SELECT} WHERE p.id = $1`,
-      [req.params.id]
-    );
+      await client.query(
+        `UPDATE payments
+         SET amount = $1,
+             payment_date = $2,
+             user_id = $3,
+             payment_type_id = $4,
+             emi_product_id = $5
+         WHERE id = $6`,
+        [
+          amount,
+          payment_date,
+          user_id,
+          payment_type_id,
+          emi_product_id,
+          req.params.id,
+        ]
+      );
 
-    return success(res, mapPayment(updated.rows[0]), "Payment updated successfully");
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [
+          paymentSummaryTarget(locked.rows[0]),
+          paymentSummaryTarget({ payment_date, user_id }),
+        ],
+        client
+      );
+
+      const mapped = await fetchMappedPayment(client, req.params.id);
+      await client.query("COMMIT");
+      return success(res, mapped, "Payment updated successfully");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error updating payment");
@@ -735,17 +866,24 @@ router.patch("/:id", async (req, res) => {
 
 // Delete
 router.delete("/:id", async (req, res) => {
+  const client = await db.connect();
   try {
-    const existing = await db.query(
-      `${PAYMENT_SELECT} WHERE p.id = $1`,
-      [req.params.id]
-    );
+    await client.query("BEGIN");
+    const existing = await client.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
+      req.params.id,
+    ]);
 
     if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Payment not found");
     }
 
-    await db.query(`DELETE FROM payments WHERE id = $1`, [req.params.id]);
+    await client.query(`DELETE FROM payments WHERE id = $1`, [req.params.id]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [paymentSummaryTarget(existing.rows[0])],
+      client
+    );
+    await client.query("COMMIT");
 
     return success(
       res,
@@ -753,8 +891,15 @@ router.delete("/:id", async (req, res) => {
       "Payment deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting payment");
+  } finally {
+    client.release();
   }
 });
 

@@ -18,6 +18,10 @@ const {
   monthRangeTimestamps,
 } = require("../utils/datetime");
 const { calculateSavingsNet, calculateSavingsAmounts } = require("../services/financial");
+const {
+  yearMonthFromTimestamp,
+  rebuildAffectedMonthlyFinancialSummaries,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 function parseTransactionType(value) {
   if (value === undefined || value === null || value === "") return undefined;
@@ -52,6 +56,22 @@ const SAVING_SELECT = `
   FROM savings_transactions s
   JOIN bank_accounts b ON b.id = s.bank_account_id
 `;
+
+function savingsSummaryTarget(txn) {
+  const ym = yearMonthFromTimestamp(txn.transaction_date);
+  return {
+    user_id: txn.user_id,
+    year: ym.year,
+    month: ym.month,
+  };
+}
+
+async function fetchMappedSaving(client, savingId) {
+  const result = await client.query(`${SAVING_SELECT} WHERE s.id = $1`, [
+    savingId,
+  ]);
+  return result.rows[0] ? mapSaving(result.rows[0]) : null;
+}
 
 function validatePayload(body, { partial = false } = {}) {
   const errors = [];
@@ -309,23 +329,39 @@ router.post("/", async (req, res) => {
       }
     }
 
-    const inserted = await db.query(
-      `INSERT INTO savings_transactions
-         (user_id, bank_account_id, amount, transaction_type, transaction_date)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [user_id, bank_account_id, amount, transaction_type, transaction_date]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO savings_transactions
+           (user_id, bank_account_id, amount, transaction_type, transaction_date)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, user_id, transaction_date`,
+        [user_id, bank_account_id, amount, transaction_type, transaction_date]
+      );
 
-    const result = await db.query(`${SAVING_SELECT} WHERE s.id = $1`, [
-      inserted.rows[0].id,
-    ]);
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [savingsSummaryTarget(inserted.rows[0])],
+        client
+      );
 
-    return created(
-      res,
-      mapSaving(result.rows[0]),
-      "Savings transaction created successfully"
-    );
+      const mapped = await fetchMappedSaving(client, inserted.rows[0].id);
+      await client.query("COMMIT");
+      return created(
+        res,
+        mapped,
+        "Savings transaction created successfully"
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error creating savings transaction");
@@ -484,33 +520,61 @@ async function updateSaving(req, res, { partial = false } = {}) {
       }
     }
 
-    await db.query(
-      `UPDATE savings_transactions
-       SET user_id = $1,
-           bank_account_id = $2,
-           amount = $3,
-           transaction_type = $4,
-           transaction_date = $5
-       WHERE id = $6`,
-      [
-        user_id,
-        bank_account_id,
-        amount,
-        transaction_type,
-        transaction_date,
-        req.params.id,
-      ]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(
+        `SELECT id, user_id, transaction_date FROM savings_transactions WHERE id = $1`,
+        [req.params.id]
+      );
+      if (locked.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return notFound(res, "Savings transaction not found");
+      }
 
-    const result = await db.query(`${SAVING_SELECT} WHERE s.id = $1`, [
-      req.params.id,
-    ]);
+      await client.query(
+        `UPDATE savings_transactions
+         SET user_id = $1,
+             bank_account_id = $2,
+             amount = $3,
+             transaction_type = $4,
+             transaction_date = $5
+         WHERE id = $6`,
+        [
+          user_id,
+          bank_account_id,
+          amount,
+          transaction_type,
+          transaction_date,
+          req.params.id,
+        ]
+      );
 
-    return success(
-      res,
-      mapSaving(result.rows[0]),
-      "Savings transaction updated successfully"
-    );
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [
+          savingsSummaryTarget(locked.rows[0]),
+          savingsSummaryTarget({ user_id, transaction_date }),
+        ],
+        client
+      );
+
+      const mapped = await fetchMappedSaving(client, req.params.id);
+      await client.query("COMMIT");
+      return success(
+        res,
+        mapped,
+        "Savings transaction updated successfully"
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return serverError(res, "Error updating savings transaction");
@@ -522,17 +586,25 @@ router.patch("/:id", (req, res) => updateSaving(req, res, { partial: true }));
 
 // Delete
 router.delete("/:id", async (req, res) => {
+  const client = await db.connect();
   try {
-    const existing = await db.query(`${SAVING_SELECT} WHERE s.id = $1`, [
+    await client.query("BEGIN");
+    const existing = await client.query(`${SAVING_SELECT} WHERE s.id = $1`, [
       req.params.id,
     ]);
     if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
       return notFound(res, "Savings transaction not found");
     }
 
-    await db.query(`DELETE FROM savings_transactions WHERE id = $1`, [
+    await client.query(`DELETE FROM savings_transactions WHERE id = $1`, [
       req.params.id,
     ]);
+    await rebuildAffectedMonthlyFinancialSummaries(
+      [savingsSummaryTarget(existing.rows[0])],
+      client
+    );
+    await client.query("COMMIT");
 
     return success(
       res,
@@ -540,8 +612,15 @@ router.delete("/:id", async (req, res) => {
       "Savings transaction deleted successfully"
     );
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* ignore */
+    }
     console.error(err);
     return serverError(res, "Error deleting savings transaction");
+  } finally {
+    client.release();
   }
 });
 

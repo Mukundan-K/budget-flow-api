@@ -10,6 +10,7 @@ const { parseAmount, formatAmount, addAmounts } = require("../utils/money");
 const {
   formatTimestamp,
   monthRangeTimestamps,
+  APP_TIMEZONE,
 } = require("../utils/datetime");
 const { getMonths, isValidMonth } = require("../masters/month.master");
 const { getYears, isValidYear } = require("../masters/year.master");
@@ -23,6 +24,20 @@ const {
 const {
   getDebtMonthNetForMonth,
 } = require("../services/financial/debtMonth.service");
+const {
+  getIncomingBreakdownForMonth,
+  getOutgoingPaymentsTotalForMonth,
+  getExpenseTotalForMonth,
+  getSavingsMonthNetForMonth,
+  findEarliestYearMonth,
+} = require("../services/financial/monthFacts.query");
+const {
+  EMPTY_FACTS,
+  yearMonthKey,
+  loadMonthlyFinancialSummariesInRange,
+  loadStoredPreviousBalancesInRange,
+  monthInputsFromFacts,
+} = require("../services/financial/monthlyFinancialSummary.service");
 
 function toAmount(value) {
   const amount = parseAmount(value);
@@ -102,68 +117,10 @@ function parseDashboardPeriod(month, year) {
   return { mode: "month", month: selectedMonth, year: selectedYear };
 }
 
-async function getIncomingBreakdownForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-  const result = await db.query(
-    `SELECT
-       COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total,
-       COALESCE(SUM(
-         CASE WHEN pt.is_income = TRUE
-           THEN p.amount - COALESCE(ret.returned_amount, 0)
-           ELSE 0
-         END
-       ), 0) AS earned,
-       COALESCE(SUM(
-         CASE WHEN pt.is_income = FALSE
-           THEN p.amount - COALESCE(ret.returned_amount, 0)
-           ELSE 0
-         END
-       ), 0) AS not_earned
-     FROM payments p
-     JOIN payment_types pt ON pt.id = p.payment_type_id
-     LEFT JOIN (
-       SELECT payment_id, SUM(amount) AS returned_amount
-       FROM payment_returns
-       GROUP BY payment_id
-     ) ret ON ret.payment_id = p.id
-     WHERE p.user_id = $1
-       AND pt.flow = 'incoming'
-       AND p.payment_date >= $2
-       AND p.payment_date <= $3`,
-    [userId, start, end]
-  );
-  const row = result.rows[0];
-  return {
-    total: toAmount(row.total),
-    earned: toAmount(row.earned),
-    not_earned: toAmount(row.not_earned),
-  };
-}
-
 /** @deprecated use getIncomingBreakdownForMonth — kept as alias for salary/income total */
 async function getIncomeTotalForMonth(userId, year, month) {
   const breakdown = await getIncomingBreakdownForMonth(userId, year, month);
   return breakdown.total;
-}
-
-async function getOutgoingPaymentsTotalForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-  const result = await db.query(
-    `SELECT COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total
-     FROM payments p
-     JOIN payment_types pt ON pt.id = p.payment_type_id
-     LEFT JOIN (
-       SELECT payment_id, SUM(amount) AS returned_amount
-       FROM payment_returns
-       GROUP BY payment_id
-     ) ret ON ret.payment_id = p.id
-     WHERE p.user_id = $1
-       AND pt.flow = 'outgoing'
-       AND p.payment_date >= $2
-       AND p.payment_date <= $3`,
-    [userId, start, end]
-  );
-  return toAmount(result.rows[0].total);
 }
 
 /** EMI payments for the month — net amount + count (subset of outgoing). */
@@ -192,46 +149,17 @@ async function getEmiStatsForMonth(userId, year, month) {
   };
 }
 
-async function getExpenseTotalForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-  const result = await db.query(
-    `SELECT COALESCE(SUM(e.amount - COALESCE(ret.returned_amount, 0)), 0) AS total
-     FROM expenses e
-     LEFT JOIN (
-       SELECT expense_id, SUM(amount) AS returned_amount
-       FROM expense_returns
-       GROUP BY expense_id
-     ) ret ON ret.expense_id = e.id
-     WHERE e.user_id = $1
-       AND e.expense_date >= $2
-       AND e.expense_date <= $3`,
-    [userId, start, end]
-  );
-  return toAmount(result.rows[0].total);
-}
-
 /**
- * Necessary / unnecessary nets for the month (split-aware, after returns).
+ * Necessary / unnecessary nets (split-aware, after returns).
+ *
+ * Tables: expenses, expense_category_splits, expense_returns
+ * Date filter: expenses.expense_date (parent month), not return_date
+ * No splits → header amount minus all returns on that expense
+ * With splits → split amount minus returns matched by LOWER(category)
+ * Classification: COALESCE(split.expense_type, expense.expense_type, TRUE)
+ *   TRUE = necessary / wanted, FALSE = unnecessary / unwanted
  */
-async function getExpenseTypeNetsForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-  const result = await db.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS necessary,
-       COALESCE(SUM(CASE WHEN NOT t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS unnecessary
-     FROM (
-       SELECT
-         COALESCE(s.expense_type, e.expense_type, TRUE) AS is_necessary,
-         CASE
-           WHEN s.id IS NULL THEN
-             e.amount - COALESCE((
-               SELECT SUM(er.amount)
-               FROM expense_returns er
-               WHERE er.expense_id = e.id
-             ), 0)
-           ELSE
-             s.amount - COALESCE(r.returned_amount, 0)
-         END AS net_amount
+const EXPENSE_TYPE_NETS_FROM = `
        FROM expenses e
        LEFT JOIN expense_category_splits s ON s.expense_id = e.id
        LEFT JOIN (
@@ -244,7 +172,39 @@ async function getExpenseTypeNetsForMonth(userId, year, month) {
         AND r.category_key = LOWER(s.category)
        WHERE e.user_id = $1
          AND e.expense_date >= $2
-         AND e.expense_date <= $3
+         AND e.expense_date <= $3`;
+
+const EXPENSE_TYPE_NETS_SELECT = `
+         COALESCE(s.expense_type, e.expense_type, TRUE) AS is_necessary,
+         CASE
+           WHEN s.id IS NULL THEN
+             e.amount - COALESCE((
+               SELECT SUM(er.amount)
+               FROM expense_returns er
+               WHERE er.expense_id = e.id
+             ), 0)
+           ELSE
+             s.amount - COALESCE(r.returned_amount, 0)
+         END AS net_amount`;
+
+const EXPENSE_CHART_BASE_SELECT = `
+         COALESCE(s.category, e.category) AS category,
+         ${EXPENSE_TYPE_NETS_SELECT}`;
+
+function emptyExpenseTypeNets() {
+  return { necessary: 0, unnecessary: 0 };
+}
+
+async function getExpenseTypeNetsForMonth(userId, year, month) {
+  const { start, end } = monthRange(year, month);
+  const result = await db.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS necessary,
+       COALESCE(SUM(CASE WHEN NOT t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS unnecessary
+     FROM (
+       SELECT
+         ${EXPENSE_TYPE_NETS_SELECT}
+       ${EXPENSE_TYPE_NETS_FROM}
      ) t`,
     [userId, start, end]
   );
@@ -253,6 +213,46 @@ async function getExpenseTypeNetsForMonth(userId, year, month) {
     necessary: toAmount(result.rows[0].necessary),
     unnecessary: toAmount(result.rows[0].unnecessary),
   };
+}
+
+/**
+ * Same nets as 12 × getExpenseTypeNetsForMonth for a calendar year, one query.
+ * Months with no expenses are { necessary: 0, unnecessary: 0 }.
+ * Month buckets use APP_TIMEZONE, matching monthRangeTimestamps.
+ */
+async function getExpenseTypeNetsForYear(userId, year) {
+  const y = Number(year);
+  const { start, end } = periodRange(y, null, "year");
+  const byMonth = Array.from({ length: 12 }, (_, index) => ({
+    month: index + 1,
+    year: y,
+    ...emptyExpenseTypeNets(),
+  }));
+
+  const result = await db.query(
+    `SELECT
+       t.month,
+       COALESCE(SUM(CASE WHEN t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS necessary,
+       COALESCE(SUM(CASE WHEN NOT t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS unnecessary
+     FROM (
+       SELECT
+         EXTRACT(MONTH FROM (e.expense_date AT TIME ZONE $4))::int AS month,
+         ${EXPENSE_TYPE_NETS_SELECT}
+       ${EXPENSE_TYPE_NETS_FROM}
+     ) t
+     GROUP BY t.month`,
+    [userId, start, end, APP_TIMEZONE]
+  );
+
+  result.rows.forEach((row) => {
+    const month = Number(row.month);
+    if (month >= 1 && month <= 12) {
+      byMonth[month - 1].necessary = toAmount(row.necessary);
+      byMonth[month - 1].unnecessary = toAmount(row.unnecessary);
+    }
+  });
+
+  return byMonth;
 }
 
 /**
@@ -334,53 +334,23 @@ function assignPolarAreaColors(slices) {
   });
 }
 
-async function getCategoryPolarArea(userId, start, end) {
-  const result = await db.query(
-    `SELECT
-       t.category,
-       COALESCE(SUM(t.net_amount), 0) AS total,
-       COALESCE(SUM(CASE WHEN t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS necessary_total,
-       COALESCE(SUM(CASE WHEN NOT t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS unnecessary_total
-     FROM (
-       SELECT
-         COALESCE(s.category, e.category) AS category,
-         COALESCE(s.expense_type, e.expense_type, TRUE) AS is_necessary,
-         CASE
-           WHEN s.id IS NULL THEN
-             e.amount - COALESCE((
-               SELECT SUM(er.amount)
-               FROM expense_returns er
-               WHERE er.expense_id = e.id
-             ), 0)
-           ELSE
-             s.amount - COALESCE(r.returned_amount, 0)
-         END AS net_amount
-       FROM expenses e
-       LEFT JOIN expense_category_splits s ON s.expense_id = e.id
-       LEFT JOIN (
-         SELECT expense_id, LOWER(category) AS category_key, SUM(amount) AS returned_amount
-         FROM expense_returns
-         GROUP BY expense_id, LOWER(category)
-       ) r
-         ON s.id IS NOT NULL
-        AND r.expense_id = e.id
-        AND r.category_key = LOWER(s.category)
-       WHERE e.user_id = $1
-         AND e.expense_date >= $2
-         AND e.expense_date <= $3
-     ) t
-     GROUP BY t.category
-     HAVING COALESCE(SUM(t.net_amount), 0) > 0
-     ORDER BY total DESC`,
-    [userId, start, end]
-  );
-
-  const slices = result.rows.map((row) => ({
+function buildPolarAreaFromCategoryRows(rows) {
+  const slices = rows.map((row) => ({
     category: row.category,
     total: toAmount(row.total),
-    necessary_total: toAmount(row.necessary_total),
-    unnecessary_total: toAmount(row.unnecessary_total),
+    necessary_total: toAmount(
+      row.necessary_total != null ? row.necessary_total : row.necessary
+    ),
+    unnecessary_total: toAmount(
+      row.unnecessary_total != null ? row.unnecessary_total : row.unnecessary
+    ),
   }));
+
+  slices.sort((a, b) => {
+    const byTotal = b.total - a.total;
+    if (byTotal !== 0) return byTotal;
+    return String(a.category || "").localeCompare(String(b.category || ""));
+  });
 
   // Chart shows top 10 categories by total only
   const topSlices = slices.slice(0, 10);
@@ -403,6 +373,132 @@ async function getCategoryPolarArea(userId, start, end) {
     series: withPct.map((s) => s.total),
     colors: withPct.map((s) => s.color),
     slices: withPct,
+  };
+}
+
+async function getCategoryPolarArea(userId, start, end) {
+  const result = await db.query(
+    `SELECT
+       t.category,
+       COALESCE(SUM(t.net_amount), 0) AS total,
+       COALESCE(SUM(CASE WHEN t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS necessary_total,
+       COALESCE(SUM(CASE WHEN NOT t.is_necessary THEN t.net_amount ELSE 0 END), 0) AS unnecessary_total
+     FROM (
+       SELECT
+         ${EXPENSE_CHART_BASE_SELECT}
+       ${EXPENSE_TYPE_NETS_FROM}
+     ) t
+     GROUP BY t.category
+     HAVING COALESCE(SUM(t.net_amount), 0) > 0
+     ORDER BY total DESC`,
+    [userId, start, end]
+  );
+
+  return buildPolarAreaFromCategoryRows(result.rows);
+}
+
+/**
+ * One round trip: same split-aware base rows as polar + type-nets, then two
+ * aggregates via UNION ALL (section = 'polar' | 'type').
+ * Returns are pre-aggregated by (expense_id, LOWER(category)) before joining
+ * splits, so multiple splits cannot double-count return rows.
+ */
+async function queryExpenseCharts(userId, start, end, { includeMonth } = {}) {
+  const monthSelect = includeMonth
+    ? `EXTRACT(MONTH FROM (e.expense_date AT TIME ZONE $4))::int AS month,`
+    : `NULL::int AS month,`;
+
+  const typeBranch = includeMonth
+    ? `SELECT
+        'type'::text AS section,
+        NULL::text AS category,
+        month,
+        0::numeric AS total,
+        COALESCE(SUM(CASE WHEN is_necessary THEN net_amount ELSE 0 END), 0) AS necessary,
+        COALESCE(SUM(CASE WHEN NOT is_necessary THEN net_amount ELSE 0 END), 0) AS unnecessary
+      FROM base
+      GROUP BY month`
+    : `SELECT
+        'type'::text AS section,
+        NULL::text AS category,
+        NULL::int AS month,
+        0::numeric AS total,
+        COALESCE(SUM(CASE WHEN is_necessary THEN net_amount ELSE 0 END), 0) AS necessary,
+        COALESCE(SUM(CASE WHEN NOT is_necessary THEN net_amount ELSE 0 END), 0) AS unnecessary
+      FROM base`;
+
+  const result = await db.query(
+    `-- expense_charts_combined
+     WITH base AS (
+       SELECT
+         ${monthSelect}
+         ${EXPENSE_CHART_BASE_SELECT}
+       ${EXPENSE_TYPE_NETS_FROM}
+     )
+     (
+       SELECT
+         'polar'::text AS section,
+         category,
+         NULL::int AS month,
+         COALESCE(SUM(net_amount), 0) AS total,
+         COALESCE(SUM(CASE WHEN is_necessary THEN net_amount ELSE 0 END), 0) AS necessary,
+         COALESCE(SUM(CASE WHEN NOT is_necessary THEN net_amount ELSE 0 END), 0) AS unnecessary
+       FROM base
+       GROUP BY category
+       HAVING COALESCE(SUM(net_amount), 0) > 0
+       ORDER BY total DESC
+     )
+     UNION ALL
+     (
+       ${typeBranch}
+     )`,
+    includeMonth ? [userId, start, end, APP_TIMEZONE] : [userId, start, end]
+  );
+
+  return result.rows;
+}
+
+async function getExpenseChartsForMonth(userId, year, month) {
+  const { start, end } = monthRange(year, month);
+  const rows = await queryExpenseCharts(userId, start, end, {
+    includeMonth: false,
+  });
+  const typeRow = rows.find((row) => row.section === "type");
+  return {
+    polar_area: buildPolarAreaFromCategoryRows(
+      rows.filter((row) => row.section === "polar")
+    ),
+    typeNets: {
+      necessary: toAmount(typeRow && typeRow.necessary),
+      unnecessary: toAmount(typeRow && typeRow.unnecessary),
+    },
+  };
+}
+
+async function getExpenseChartsForYear(userId, year) {
+  const y = Number(year);
+  const { start, end } = periodRange(y, null, "year");
+  const rows = await queryExpenseCharts(userId, start, end, {
+    includeMonth: true,
+  });
+  const typeNetsByMonth = Array.from({ length: 12 }, (_, index) => ({
+    month: index + 1,
+    year: y,
+    ...emptyExpenseTypeNets(),
+  }));
+  rows.forEach((row) => {
+    if (row.section !== "type") return;
+    const month = Number(row.month);
+    if (month >= 1 && month <= 12) {
+      typeNetsByMonth[month - 1].necessary = toAmount(row.necessary);
+      typeNetsByMonth[month - 1].unnecessary = toAmount(row.unnecessary);
+    }
+  });
+  return {
+    polar_area: buildPolarAreaFromCategoryRows(
+      rows.filter((row) => row.section === "polar")
+    ),
+    typeNetsByMonth,
   };
 }
 
@@ -870,28 +966,6 @@ function buildChartsBundle({
   return charts;
 }
 
-/** Savings month net (credited − debited) — applied as from_savings in balance. */
-async function getSavingsMonthNetForMonth(userId, year, month) {
-  const { start, end } = monthRange(year, month);
-  const result = await db.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE 0 END), 0) AS credited,
-       COALESCE(SUM(CASE WHEN transaction_type = 'debit' THEN amount ELSE 0 END), 0) AS debited
-     FROM savings_transactions
-     WHERE user_id = $1
-       AND transaction_date >= $2
-       AND transaction_date <= $3`,
-    [userId, start, end]
-  );
-  const credited = toAmount(result.rows[0].credited);
-  const debited = toAmount(result.rows[0].debited);
-  return {
-    credited,
-    debited,
-    month_net: roundMoney(credited - debited),
-  };
-}
-
 async function getLatestSalaryPayment(userId, year, month) {
   const { start, end } = monthRange(year, month);
   const result = await db.query(
@@ -921,181 +995,332 @@ async function getStoredPreviousBalance(userId, year, month) {
   return toAmount(result.rows[0].previous_month_balance);
 }
 
-async function findEarliestYearMonth(userId) {
-  const result = await db.query(
-    `
-    SELECT MIN(d) AS earliest FROM (
-      SELECT MIN(payment_date) AS d FROM payments WHERE user_id = $1
-      UNION ALL
-      SELECT MIN(expense_date) AS d FROM expenses WHERE user_id = $1
-      UNION ALL
-      SELECT MIN(transaction_date) AS d FROM savings_transactions WHERE user_id = $1
-      UNION ALL
-      SELECT MIN(debt_date) AS d FROM debts WHERE user_id = $1
-      UNION ALL
-      SELECT MAKE_DATE(year, month, 1) AS d FROM monthly_balances WHERE user_id = $1
-    ) t
-    `,
-    [userId]
-  );
-
-  const earliest = result.rows[0]?.earliest;
-  if (!earliest) return null;
-
-  const date = new Date(earliest);
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-  };
-}
-
-async function buildMonthOverview(userId, year, month) {
-  const target = { year: Number(year), month: Number(month) };
-  const earliest = await findEarliestYearMonth(userId);
-
-  let previousMonthBalance = 0;
+function walkStartForTarget(earliest, target) {
   let cursor = earliest || target;
-
   if (earliest && compareYearMonth(target, earliest) < 0) {
     cursor = target;
   }
+  return cursor;
+}
 
-  while (compareYearMonth(cursor, target) <= 0) {
+async function loadSourceMonthFacts(userId, year, month) {
+  const incomingBreakdown = await getIncomingBreakdownForMonth(
+    userId,
+    year,
+    month
+  );
+  const outgoingPayments = await getOutgoingPaymentsTotalForMonth(
+    userId,
+    year,
+    month
+  );
+  const expenseTotal = await getExpenseTotalForMonth(userId, year, month);
+  const savings = await getSavingsMonthNetForMonth(userId, year, month);
+  const debtInfo = await getDebtMonthNetForMonth(userId, year, month);
+  return {
+    salary: incomingBreakdown.total,
+    earned: incomingBreakdown.earned,
+    not_earned: incomingBreakdown.not_earned,
+    outgoingPayments,
+    expenseTotal,
+    savings,
+    fromSavings: savings.month_net,
+    debtInfo,
+    debt: debtInfo.debt,
+  };
+}
+
+function loadSummaryMonthFacts(facts) {
+  const inputs = monthInputsFromFacts(facts || EMPTY_FACTS);
+  return {
+    salary: inputs.incoming,
+    earned: inputs.earned,
+    not_earned: inputs.not_earned,
+    outgoingPayments: inputs.outgoing,
+    expenseTotal: inputs.expenses,
+    savings: inputs.savings,
+    fromSavings: inputs.savings.month_net,
+    debtInfo: inputs.debtInfo,
+    debt: inputs.debtInfo.debt,
+  };
+}
+
+function assembleMonthOverview({
+  userId,
+  year,
+  month,
+  previous,
+  monthly,
+  salary,
+  earned,
+  not_earned,
+  outgoingPayments,
+  expenseTotal,
+  savings,
+  fromSavings,
+  debt,
+  debtInfo,
+  latestSalary,
+  emiStats,
+}) {
+  return {
+    user_id: Number(userId),
+    month,
+    year,
+    date: latestSalary ? formatTimestamp(latestSalary.payment_date) : null,
+    salary,
+    // Effective value used in balance math (manual override or calculated)
+    previous_month_balance: previous.previous_month_balance,
+    // Auto value = previous month Remaining (before any edit)
+    previous_month_balance_calculated: previous.previous_month_balance_calculated,
+    previous_month_balance_manual: previous.previous_month_balance_manual,
+    // Canonical aliases
+    previous_balance: previous.previous_balance,
+    previous_balance_calculated: previous.previous_balance_calculated,
+    previous_balance_manual: previous.previous_balance_manual,
+    from_savings: fromSavings,
+    savings_credited: fromSavings,
+    savings_month_net: fromSavings,
+    savings_amount_saved: savings.credited,
+    savings_amount_debited: savings.debited,
+    debt,
+    debt_given_net: debtInfo.given_net,
+    debt_received_net: debtInfo.received_net,
+    debt_given_total: debtInfo.given_total,
+    debt_given_returned: debtInfo.given_returned,
+    debt_received_total: debtInfo.received_total,
+    debt_received_returned: debtInfo.received_returned,
+    debt_received_repaid_this_month: debtInfo.received_repaid_this_month,
+    debt_received_repaid_past_months: debtInfo.received_repaid_past_months,
+    total_amount_to_spend: monthly.total_amount_to_spend,
+    total_spent: monthly.spent,
+    total_deductions: monthly.total_deductions,
+    total_expenses: monthly.spent,
+    expense_total: expenseTotal,
+    outgoing_payments_total: outgoingPayments,
+    emis: emiStats.emis,
+    emi_count: emiStats.emi_count,
+    // Remaining — becomes next month's calculated previous balance
+    current_balance: monthly.remaining,
+    remaining: monthly.remaining,
+    incoming: salary,
+    earned,
+    not_earned,
+    // Available = earned + previous_month_balance
+    available: monthly.available,
+    available_split: monthly.available_split,
+    spent: monthly.spent,
+    savings: fromSavings,
+  };
+}
+
+async function walkMonthOverviewRange(userId, from, to, options = {}) {
+  const factsSource = options.factsSource || "summary";
+  const extraMonths = options.extraMonths || [];
+  const extraSet = new Set(
+    extraMonths.map((period) => yearMonthKey(period.year, period.month))
+  );
+
+  let summaryMap = options.summaryMap;
+  let previousMap = options.previousMap;
+  if (factsSource === "summary") {
+    if (!summaryMap) {
+      summaryMap = await loadMonthlyFinancialSummariesInRange(userId, from, to);
+    }
+    if (!previousMap) {
+      previousMap = await loadStoredPreviousBalancesInRange(userId, from, to);
+    }
+  }
+
+  const results = new Map();
+  let previousMonthBalance = 0;
+  let cursor = { year: from.year, month: from.month };
+
+  while (compareYearMonth(cursor, to) <= 0) {
+    const key = yearMonthKey(cursor.year, cursor.month);
     // Default previous balance = previous month's Remaining (current_balance).
     // Manual edit in monthly_balances overrides that for this month only.
+    // A stored value of 0 is a valid override (Map.has, not truthiness).
     const calculatedPreviousMonthBalance = previousMonthBalance;
-    const storedPrevious = await getStoredPreviousBalance(
-      userId,
-      cursor.year,
-      cursor.month
-    );
+    const storedPrevious =
+      factsSource === "summary"
+        ? previousMap.has(key)
+          ? previousMap.get(key)
+          : null
+        : await getStoredPreviousBalance(userId, cursor.year, cursor.month);
     const previous = calculatePreviousBalance({
       manual: storedPrevious,
       calculated: calculatedPreviousMonthBalance,
     });
     previousMonthBalance = previous.previous_balance;
 
-    const incomingBreakdown = await getIncomingBreakdownForMonth(
-      userId,
-      cursor.year,
-      cursor.month
-    );
-    const salary = incomingBreakdown.total;
-    const earned = incomingBreakdown.earned;
-    const not_earned = incomingBreakdown.not_earned;
-    const outgoingPayments = await getOutgoingPaymentsTotalForMonth(
-      userId,
-      cursor.year,
-      cursor.month
-    );
-    const expenseTotal = await getExpenseTotalForMonth(
-      userId,
-      cursor.year,
-      cursor.month
-    );
-    // From savings = month net (credited − debited)
-    const savings = await getSavingsMonthNetForMonth(
-      userId,
-      cursor.year,
-      cursor.month
-    );
-    const fromSavings = savings.month_net;
-    const debtInfo = await getDebtMonthNetForMonth(
-      userId,
-      cursor.year,
-      cursor.month
-    );
-    const debt = debtInfo.debt;
+    const factsBundle =
+      factsSource === "summary"
+        ? loadSummaryMonthFacts(summaryMap.get(key) || EMPTY_FACTS)
+        : await loadSourceMonthFacts(userId, cursor.year, cursor.month);
 
-    // Authoritative Remaining formula (centralized):
-    // Remaining = Incoming + Previous − Spent − Savings − Debt
     const monthly = calculateMonthlyBalance({
-      incoming: salary,
-      earned,
-      not_earned,
+      incoming: factsBundle.salary,
+      earned: factsBundle.earned,
+      not_earned: factsBundle.not_earned,
       previous: previousMonthBalance,
-      expense_total: expenseTotal,
-      outgoing_payments_total: outgoingPayments,
-      savings: fromSavings,
-      debt,
+      expense_total: factsBundle.expenseTotal,
+      outgoing_payments_total: factsBundle.outgoingPayments,
+      savings: factsBundle.fromSavings,
+      debt: factsBundle.debt,
     });
-    const totalAmountToSpend = monthly.total_amount_to_spend;
-    const available = monthly.available;
-    const totalSpent = monthly.spent;
-    const totalDeductions = monthly.total_deductions;
-    const currentBalance = monthly.remaining;
 
-    if (cursor.year === target.year && cursor.month === target.month) {
-      const latestSalary = await getLatestSalaryPayment(
+    const isExtra = extraSet.has(key);
+    let latestSalary = null;
+    let emiStats = { emis: 0, emi_count: 0 };
+    let debtInfo = factsBundle.debtInfo;
+
+    if (isExtra) {
+      latestSalary = await getLatestSalaryPayment(
         userId,
         cursor.year,
         cursor.month
       );
-      const emiStats = await getEmiStatsForMonth(
-        userId,
-        cursor.year,
-        cursor.month
-      );
-
-      return {
-        user_id: Number(userId),
-        month: cursor.month,
-        year: cursor.year,
-        date: latestSalary
-          ? formatTimestamp(latestSalary.payment_date)
-          : null,
-        salary,
-        // Effective value used in balance math (manual override or calculated)
-        previous_month_balance: previous.previous_month_balance,
-        // Auto value = previous month Remaining (before any edit)
-        previous_month_balance_calculated:
-          previous.previous_month_balance_calculated,
-        previous_month_balance_manual: previous.previous_month_balance_manual,
-        // Canonical aliases
-        previous_balance: previous.previous_balance,
-        previous_balance_calculated: previous.previous_balance_calculated,
-        previous_balance_manual: previous.previous_balance_manual,
-        from_savings: fromSavings,
-        savings_credited: fromSavings,
-        savings_month_net: fromSavings,
-        savings_amount_saved: savings.credited,
-        savings_amount_debited: savings.debited,
-        debt,
-        debt_given_net: debtInfo.given_net,
-        debt_received_net: debtInfo.received_net,
-        debt_given_total: debtInfo.given_total,
-        debt_given_returned: debtInfo.given_returned,
-        debt_received_total: debtInfo.received_total,
-        debt_received_returned: debtInfo.received_returned,
-        debt_received_repaid_this_month: debtInfo.received_repaid_this_month,
-        debt_received_repaid_past_months: debtInfo.received_repaid_past_months,
-        total_amount_to_spend: totalAmountToSpend,
-        total_spent: totalSpent,
-        total_deductions: totalDeductions,
-        total_expenses: totalSpent,
-        expense_total: expenseTotal,
-        outgoing_payments_total: outgoingPayments,
-        emis: emiStats.emis,
-        emi_count: emiStats.emi_count,
-        // Remaining — becomes next month's calculated previous balance
-        current_balance: currentBalance,
-        remaining: currentBalance,
-        incoming: salary,
-        earned,
-        not_earned,
-        // Available = earned + previous_month_balance
-        available,
-        available_split: monthly.available_split,
-        spent: totalSpent,
-        savings: fromSavings,
-      };
+      emiStats = await getEmiStatsForMonth(userId, cursor.year, cursor.month);
+      if (factsSource === "summary") {
+        const liveDebt = await getDebtMonthNetForMonth(
+          userId,
+          cursor.year,
+          cursor.month
+        );
+        debtInfo = {
+          ...debtInfo,
+          received_repaid_this_month: liveDebt.received_repaid_this_month,
+          received_repaid_past_months: liveDebt.received_repaid_past_months,
+        };
+      }
     }
 
-    previousMonthBalance = currentBalance;
+    results.set(
+      key,
+      assembleMonthOverview({
+        userId,
+        year: cursor.year,
+        month: cursor.month,
+        previous,
+        monthly,
+        salary: factsBundle.salary,
+        earned: factsBundle.earned,
+        not_earned: factsBundle.not_earned,
+        outgoingPayments: factsBundle.outgoingPayments,
+        expenseTotal: factsBundle.expenseTotal,
+        savings: factsBundle.savings,
+        fromSavings: factsBundle.fromSavings,
+        debt: factsBundle.debt,
+        debtInfo,
+        latestSalary,
+        emiStats,
+      })
+    );
+
+    previousMonthBalance = monthly.remaining;
     cursor = nextMonth(cursor.year, cursor.month);
   }
 
-  return null;
+  return results;
+}
+
+async function buildMonthOverviewWithSource(userId, year, month, factsSource) {
+  const target = { year: Number(year), month: Number(month) };
+  const earliest = await findEarliestYearMonth(userId);
+  const from = walkStartForTarget(earliest, target);
+  const map = await walkMonthOverviewRange(userId, from, target, {
+    factsSource,
+    extraMonths: [target],
+  });
+  return map.get(yearMonthKey(target.year, target.month)) || null;
+}
+
+async function buildMonthOverviewFromSource(userId, year, month) {
+  return buildMonthOverviewWithSource(userId, year, month, "source");
+}
+
+async function buildMonthOverviewFromSummary(userId, year, month) {
+  return buildMonthOverviewWithSource(userId, year, month, "summary");
+}
+
+async function buildMonthOverview(userId, year, month) {
+  return buildMonthOverviewFromSummary(userId, year, month);
+}
+
+async function buildMonthOverviewsForCalendarYear(userId, year, options = {}) {
+  const y = Number(year);
+  const factsSource = options.factsSource || "summary";
+  const extraMonths = options.extraMonths || [];
+  const jan = { year: y, month: 1 };
+  const dec = { year: y, month: 12 };
+  const earliest = await findEarliestYearMonth(userId);
+  const map = new Map();
+
+  let summaryMap;
+  let previousMap;
+  if (factsSource === "summary") {
+    const from =
+      earliest && compareYearMonth(earliest, jan) < 0 ? earliest : jan;
+    summaryMap = await loadMonthlyFinancialSummariesInRange(userId, from, dec);
+    previousMap = await loadStoredPreviousBalancesInRange(userId, from, dec);
+  }
+
+  const mergeRange = async (from, to) => {
+    const part = await walkMonthOverviewRange(userId, from, to, {
+      factsSource,
+      extraMonths,
+      summaryMap,
+      previousMap,
+    });
+    part.forEach((value, key) => map.set(key, value));
+  };
+
+  if (!earliest) {
+    for (let m = 1; m <= 12; m++) {
+      await mergeRange({ year: y, month: m }, { year: y, month: m });
+    }
+    return map;
+  }
+
+  if (compareYearMonth(jan, earliest) >= 0) {
+    await mergeRange(earliest, dec);
+    return map;
+  }
+
+  const lastStandalone = earliest.year === y ? earliest.month - 1 : 12;
+  for (let m = 1; m <= lastStandalone; m++) {
+    await mergeRange({ year: y, month: m }, { year: y, month: m });
+  }
+  if (earliest.year === y && compareYearMonth(earliest, dec) <= 0) {
+    await mergeRange(earliest, dec);
+  }
+  return map;
+}
+
+function collectTrendPointsFromOverviews(overviews, year) {
+  const points = [];
+  for (let m = 1; m <= 12; m++) {
+    const overview = overviews.get(yearMonthKey(year, m));
+    if (!overview) continue;
+    points.push({
+      month: m,
+      year: Number(year),
+      income: overview.salary,
+      earned: overview.earned || 0,
+      not_earned: overview.not_earned || 0,
+      spent: roundMoney(
+        overview.expense_total + overview.outgoing_payments_total
+      ),
+      from_savings: overview.from_savings,
+      debt: overview.debt,
+      balance: overview.current_balance,
+      expense_total: overview.expense_total,
+      necessary: 0,
+      unnecessary: 0,
+    });
+  }
+  return points;
 }
 
 /**
@@ -1113,14 +1338,19 @@ async function buildDashboard(userId, year, month, mode = "month") {
     return buildDashboardForYear(userId, year);
   }
 
-  const overview = await buildMonthOverview(userId, year, month);
+  const overviews = await buildMonthOverviewsForCalendarYear(userId, year, {
+    factsSource: "summary",
+    extraMonths: [{ year: Number(year), month: Number(month) }],
+  });
+  const overview = overviews.get(yearMonthKey(year, month));
   if (!overview) return null;
 
-  const typeNets = await getExpenseTypeNetsForMonth(userId, year, month);
   const { start, end } = periodRange(year, month, "month");
-  const polar_area = await getCategoryPolarArea(userId, start, end);
+  const expenseCharts = await getExpenseChartsForMonth(userId, year, month);
+  const typeNets = expenseCharts.typeNets;
+  const polar_area = expenseCharts.polar_area;
   const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
-  const monthly_trend_points = await collectMonthlyTrendPoints(userId, year);
+  const monthly_trend_points = collectTrendPointsFromOverviews(overviews, year);
 
   const income = overview.salary;
   const earned = overview.earned;
@@ -1220,28 +1450,11 @@ async function buildDashboard(userId, year, month, mode = "month") {
 }
 
 async function collectMonthlyTrendPoints(userId, year) {
-  const points = [];
-  for (let m = 1; m <= 12; m++) {
-    const overview = await buildMonthOverview(userId, year, m);
-    if (!overview) continue;
-    points.push({
-      month: m,
-      year: Number(year),
-      income: overview.salary,
-      earned: overview.earned || 0,
-      not_earned: overview.not_earned || 0,
-      spent: roundMoney(
-        overview.expense_total + overview.outgoing_payments_total
-      ),
-      from_savings: overview.from_savings,
-      debt: overview.debt,
-      balance: overview.current_balance,
-      expense_total: overview.expense_total,
-      necessary: 0,
-      unnecessary: 0,
-    });
-  }
-  return points;
+  const overviews = await buildMonthOverviewsForCalendarYear(userId, year, {
+    factsSource: "summary",
+    extraMonths: [],
+  });
+  return collectTrendPointsFromOverviews(overviews, year);
 }
 
 async function buildDashboardForYear(userId, year) {
@@ -1264,11 +1477,18 @@ async function buildDashboardForYear(userId, year) {
   let date = null;
   const monthly_trend_points = [];
 
+  const overviews = await buildMonthOverviewsForCalendarYear(userId, year, {
+    factsSource: "summary",
+    extraMonths: [{ year: Number(year), month: 12 }],
+  });
+  const expenseCharts = await getExpenseChartsForYear(userId, year);
+  const typeNetsByMonth = expenseCharts.typeNetsByMonth;
+
   for (let m = 1; m <= 12; m++) {
-    const overview = await buildMonthOverview(userId, year, m);
+    const overview = overviews.get(yearMonthKey(year, m));
     if (!overview) continue;
 
-    const typeNets = await getExpenseTypeNetsForMonth(userId, year, m);
+    const typeNets = typeNetsByMonth[m - 1];
 
     if (m === 1) {
       previous_balance = overview.previous_month_balance;
@@ -1331,7 +1551,7 @@ async function buildDashboardForYear(userId, year) {
   const total_deductions = roundMoney(fromSavings + spent + debt);
 
   const { start, end } = periodRange(year, null, "year");
-  const polar_area = await getCategoryPolarArea(userId, start, end);
+  const polar_area = expenseCharts.polar_area;
   const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
 
   const charts = buildChartsBundle({
@@ -1482,6 +1702,7 @@ async function updatePreviousBalance(req, res) {
       return badRequest(res, parsed.error);
     }
 
+    // Override row only. The 10 monthly_financial_summary facts are unchanged.
     const result = await db.query(
       `INSERT INTO monthly_balances (user_id, month, year, previous_month_balance, updated_at)
        VALUES ($1, $2, $3, $4, NOW())
@@ -1528,5 +1749,12 @@ router.patch("/previous-balance", updatePreviousBalance);
 module.exports = router;
 module.exports.buildDashboard = buildDashboard;
 module.exports.buildMonthOverview = buildMonthOverview;
+module.exports.buildMonthOverviewFromSource = buildMonthOverviewFromSource;
+module.exports.buildMonthOverviewFromSummary = buildMonthOverviewFromSummary;
 module.exports.parseMonthYear = parseMonthYear;
 module.exports.parseDashboardPeriod = parseDashboardPeriod;
+module.exports.getExpenseTypeNetsForMonth = getExpenseTypeNetsForMonth;
+module.exports.getExpenseTypeNetsForYear = getExpenseTypeNetsForYear;
+module.exports.getCategoryPolarArea = getCategoryPolarArea;
+module.exports.getExpenseChartsForMonth = getExpenseChartsForMonth;
+module.exports.getExpenseChartsForYear = getExpenseChartsForYear;
