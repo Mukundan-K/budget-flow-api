@@ -64,31 +64,72 @@ router.get(
 );
 
 router.post("/refresh-token", async (req, res) => {
+  const startedAt = Date.now();
   const { refreshToken } = req.body || {};
+  let step = "received";
+
+  console.log("[refresh] request received");
+  console.log("[refresh] refreshToken exists:", Boolean(refreshToken));
+  console.log(
+    "[refresh] JWT_REFRESH_SECRET configured:",
+    Boolean(process.env.JWT_REFRESH_SECRET)
+  );
 
   if (!refreshToken) {
+    console.log("[refresh] request completed");
+    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
     return unauthorized(res, "Refresh token missing");
   }
 
   try {
+    step = "jwt.verify";
+    console.log("[refresh] JWT verification started");
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    console.log("[refresh] JWT verification completed");
+    console.log("[refresh] decoded user id:", decoded && decoded.id);
 
+    step = "SELECT";
+    console.log("[refresh] SELECT started");
     const user = await pool.query("SELECT * FROM users WHERE id=$1", [
       decoded.id,
     ]);
+    console.log("[refresh] SELECT completed");
+    console.log("[refresh] user found:", user.rows.length > 0);
 
     if (user.rows.length === 0) {
+      console.log("[refresh] request completed");
+      console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
       return unauthorized(res, "User not found");
     }
 
+    const storedExists = Boolean(user.rows[0].refresh_token);
+    const matches =
+      storedExists && user.rows[0].refresh_token === refreshToken;
+    console.log("[refresh] stored refresh token exists:", storedExists);
+    console.log("[refresh] submitted token matches DB:", matches);
+
     if (!user.rows[0].refresh_token || user.rows[0].refresh_token !== refreshToken) {
+      console.log("[refresh] request completed");
+      console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
       return unauthorized(res, "Invalid refresh token");
     }
 
+    step = "issueTokens";
+    console.log("[refresh] issueTokens started");
     const tokens = await issueTokens(user.rows[0]);
+    console.log("[refresh] issueTokens completed");
+    console.log("[refresh] request completed");
+    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
 
     return success(res, tokens, "Access token refreshed successfully");
   } catch (err) {
+    console.log("[refresh] error name:", err && err.name);
+    console.log("[refresh] error code:", err && err.code);
+    console.log("[refresh] error message:", err && err.message);
+    console.log("[refresh] failed step:", step);
+    console.log("[refresh] request completed");
+    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
+
     if (err.name === "TokenExpiredError") {
       return unauthorized(res, "Refresh token expired");
     }
