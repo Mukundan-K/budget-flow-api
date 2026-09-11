@@ -32,6 +32,7 @@ const seedSavings = require("./seed/savings");
 const seedReturns = require("./seed/returns");
 const seedDebts = require("./seed/debts");
 const seedMonthlyFinancialSummary = require("./seed/monthlyFinancialSummary");
+const seedRefreshTokens = require("./seed/refreshTokens");
 
 const app = express();
 
@@ -70,6 +71,7 @@ app.listen(PORT, "0.0.0.0", () => {
         seedSavings(),
         seedDebts(),
         seedMonthlyFinancialSummary(),
+        seedRefreshTokens(),
       ])
     )
     .then(() => Promise.all([seedExpenseSplits(), seedReturns()]))

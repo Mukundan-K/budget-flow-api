@@ -3,7 +3,15 @@ const passport = require("passport");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
 const authenticate = require("../middleware/authenticate");
-const { tokenPair } = require("../utils/tokens");
+const {
+  createRefreshSession,
+  lockSessionByJti,
+  assertUsableSession,
+  rotateLockedSession,
+  revokeSessionByJti,
+  loadUserById,
+  RefreshAuthError,
+} = require("../services/auth/refreshSession.service");
 const {
   success,
   unauthorized,
@@ -13,15 +21,8 @@ const {
 
 const router = express.Router();
 
-async function issueTokens(user) {
-  const tokens = tokenPair(user);
-
-  await pool.query("UPDATE users SET refresh_token=$1 WHERE id=$2", [
-    tokens.refreshToken,
-    user.id,
-  ]);
-
-  return tokens;
+async function issueTokens(user, client = pool) {
+  return createRefreshSession(user, client);
 }
 
 function mapUser(row) {
@@ -32,6 +33,17 @@ function mapUser(row) {
     photo: row.photo,
     google_id: row.google_id,
   };
+}
+
+function decodeRefreshClaims(refreshToken) {
+  try {
+    return jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+  } catch (err) {
+    if (err.name === "TokenExpiredError") {
+      throw new RefreshAuthError("expired", "Refresh token expired");
+    }
+    throw new RefreshAuthError("jwt", "Invalid refresh token");
+  }
 }
 
 router.get(
@@ -64,76 +76,52 @@ router.get(
 );
 
 router.post("/refresh-token", async (req, res) => {
-  const startedAt = Date.now();
   const { refreshToken } = req.body || {};
-  let step = "received";
-
-  console.log("[refresh] request received");
-  console.log("[refresh] refreshToken exists:", Boolean(refreshToken));
-  console.log(
-    "[refresh] JWT_REFRESH_SECRET configured:",
-    Boolean(process.env.JWT_REFRESH_SECRET)
-  );
 
   if (!refreshToken) {
-    console.log("[refresh] request completed");
-    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
     return unauthorized(res, "Refresh token missing");
   }
 
+  let client;
   try {
-    step = "jwt.verify";
-    console.log("[refresh] JWT verification started");
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-    console.log("[refresh] JWT verification completed");
-    console.log("[refresh] decoded user id:", decoded && decoded.id);
-
-    step = "SELECT";
-    console.log("[refresh] SELECT started");
-    const user = await pool.query("SELECT * FROM users WHERE id=$1", [
-      decoded.id,
-    ]);
-    console.log("[refresh] SELECT completed");
-    console.log("[refresh] user found:", user.rows.length > 0);
-
-    if (user.rows.length === 0) {
-      console.log("[refresh] request completed");
-      console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
-      return unauthorized(res, "User not found");
-    }
-
-    const storedExists = Boolean(user.rows[0].refresh_token);
-    const matches =
-      storedExists && user.rows[0].refresh_token === refreshToken;
-    console.log("[refresh] stored refresh token exists:", storedExists);
-    console.log("[refresh] submitted token matches DB:", matches);
-
-    if (!user.rows[0].refresh_token || user.rows[0].refresh_token !== refreshToken) {
-      console.log("[refresh] request completed");
-      console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
+    const decoded = decodeRefreshClaims(refreshToken);
+    if (!decoded.id || !decoded.jti) {
       return unauthorized(res, "Invalid refresh token");
     }
 
-    step = "issueTokens";
-    console.log("[refresh] issueTokens started");
-    const tokens = await issueTokens(user.rows[0]);
-    console.log("[refresh] issueTokens completed");
-    console.log("[refresh] request completed");
-    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const session = await lockSessionByJti(decoded.jti, client);
+    assertUsableSession(session, decoded, refreshToken);
+
+    const user = await loadUserById(decoded.id, client);
+    if (!user) {
+      await client.query("ROLLBACK");
+      return unauthorized(res, "User not found");
+    }
+
+    const tokens = await rotateLockedSession(session, user, client);
+    await client.query("COMMIT");
 
     return success(res, tokens, "Access token refreshed successfully");
   } catch (err) {
-    console.log("[refresh] error name:", err && err.name);
-    console.log("[refresh] error code:", err && err.code);
-    console.log("[refresh] error message:", err && err.message);
-    console.log("[refresh] failed step:", step);
-    console.log("[refresh] request completed");
-    console.log("[refresh] total duration:", Date.now() - startedAt, "ms");
-
-    if (err.name === "TokenExpiredError") {
-      return unauthorized(res, "Refresh token expired");
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
     }
-    return unauthorized(res, "Invalid refresh token");
+
+    if (err instanceof RefreshAuthError) {
+      return unauthorized(res, err.httpMessage);
+    }
+
+    console.error("refresh-token failed:", err && err.name, err && err.code);
+    return serverError(res, "Error refreshing token");
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -181,24 +169,24 @@ router.get("/user/:id", async (req, res) => {
 
 router.post("/logout", async (req, res) => {
   try {
-    const { userId, refreshToken } = req.body || {};
-    let id = userId;
+    const { refreshToken } = req.body || {};
+    let jti = null;
 
-    if (!id && refreshToken) {
+    if (refreshToken) {
       try {
         const decoded = jwt.verify(
           refreshToken,
           process.env.JWT_REFRESH_SECRET
         );
-        id = decoded.id;
+        jti = decoded && decoded.jti;
       } catch (err) {
         const decoded = jwt.decode(refreshToken);
-        id = decoded && decoded.id;
+        jti = decoded && decoded.jti;
       }
     }
 
-    if (id) {
-      await pool.query("UPDATE users SET refresh_token=NULL WHERE id=$1", [id]);
+    if (jti) {
+      await revokeSessionByJti(jti);
     }
 
     return success(res, null, "Logged out");
@@ -209,3 +197,4 @@ router.post("/logout", async (req, res) => {
 });
 
 module.exports = router;
+module.exports.issueTokens = issueTokens;
