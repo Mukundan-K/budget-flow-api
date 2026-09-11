@@ -22,6 +22,10 @@ const {
   paidCountFromRow,
   previouslyPaidFromRow,
   emiPaidMonthsJoinSql,
+  listEmiProductsWithPaidMonths,
+  getPaidMonthsByUserAsOf,
+  emiStartedByPeriodEnd,
+  emiDashboardVisibility,
   pct: sharePct,
 } = require("../services/financial");
 const {
@@ -1331,6 +1335,109 @@ function collectTrendPointsFromOverviews(overviews, year) {
 }
 
 /**
+ * All EMI products with existing progress math, plus this-period payments.
+ * Upcoming / unpaid products are missing from spending_breakdown (payments only).
+ */
+async function getDashboardEmiOverview(userId, start, end) {
+  const [rows, periodResult, paidBeforeMap, paidThroughMap] = await Promise.all([
+    listEmiProductsWithPaidMonths(userId),
+    db.query(
+      `SELECT p.emi_product_id,
+              COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS paid_amount,
+              COUNT(p.id)::int AS payment_count
+       FROM payments p
+       LEFT JOIN (
+         SELECT payment_id, SUM(amount) AS returned_amount
+         FROM payment_returns
+         GROUP BY payment_id
+       ) ret ON ret.payment_id = p.id
+       WHERE p.user_id = $1
+         AND p.emi_product_id IS NOT NULL
+         AND p.payment_date >= $2
+         AND p.payment_date <= $3
+       GROUP BY p.emi_product_id`,
+      [userId, start, end]
+    ),
+    getPaidMonthsByUserAsOf(userId, { before: start }),
+    getPaidMonthsByUserAsOf(userId, { through: end }),
+  ]);
+
+  const periodById = new Map();
+  periodResult.rows.forEach((row) => {
+    periodById.set(Number(row.emi_product_id), {
+      paid_amount: toAmount(row.paid_amount),
+      payment_count: Number(row.payment_count) || 0,
+    });
+  });
+
+  const products = [];
+  for (const row of rows) {
+    const productId = Number(row.id);
+    const previouslyPaid = previouslyPaidFromRow(row);
+    const numberOfEmis =
+      row.number_of_emis != null ? Number(row.number_of_emis) : null;
+    const progressBefore = enrichEmiProduct({
+      already_paid: previouslyPaid,
+      paid_months: paidBeforeMap.get(productId) || 0,
+      number_of_emis: numberOfEmis,
+    });
+    const progress = enrichEmiProduct({
+      already_paid: previouslyPaid,
+      paid_months: paidThroughMap.get(productId) || 0,
+      number_of_emis: numberOfEmis,
+    });
+    const { include, completedThisPeriod } = emiDashboardVisibility({
+      startedByPeriodEnd: emiStartedByPeriodEnd(row.emi_start_from, end),
+      completedBeforePeriod: progressBefore.completed,
+      completedThroughPeriod: progress.completed,
+    });
+    if (!include) continue;
+
+    const period = periodById.get(productId) || {
+      paid_amount: 0,
+      payment_count: 0,
+    };
+
+    products.push({
+      label: row.product_name || "EMI",
+      product_name: row.product_name || "EMI",
+      emi_product_id: row.id || null,
+      start_date: formatTimestamp(row.emi_start_from),
+      already_paid: progress.already_paid,
+      previously_paid: progress.previously_paid,
+      tracked_paid_months: progress.tracked_paid_months,
+      number_of_emis: progress.number_of_emis,
+      paid: progress.paid,
+      total_paid: progress.total_paid,
+      remaining: progress.remaining,
+      emis_left: progress.emis_left,
+      progress_percentage: progress.progress_percentage,
+      complete: completedThisPeriod,
+      completed: completedThisPeriod,
+      total: period.paid_amount,
+      amount: period.paid_amount,
+      count: period.payment_count,
+      payments_this_period: period.payment_count,
+    });
+  }
+
+  const paid_this_period = roundMoney(
+    products.reduce((sum, product) => sum + (product.total || 0), 0)
+  );
+  const emi_count = products.reduce(
+    (sum, product) => sum + (product.payments_this_period || 0),
+    0
+  );
+
+  return {
+    paid_this_period,
+    emi_count,
+    products_count: products.length,
+    products,
+  };
+}
+
+/**
  * Dashboard card payload — same month math as overview, clear labels for UI.
  * Available = earned + previous_month_balance
  * Spendable (total_amount_to_spend) = Incoming + Prev. balance
@@ -1345,18 +1452,22 @@ async function buildDashboard(userId, year, month, mode = "month") {
     return buildDashboardForYear(userId, year);
   }
 
-  const overviews = await buildMonthOverviewsForCalendarYear(userId, year, {
-    factsSource: "summary",
-    extraMonths: [{ year: Number(year), month: Number(month) }],
-  });
+  const { start, end } = periodRange(year, month, "month");
+  const [overviews, expenseCharts, payment_groups, emi_overview] =
+    await Promise.all([
+      buildMonthOverviewsForCalendarYear(userId, year, {
+        factsSource: "summary",
+        extraMonths: [{ year: Number(year), month: Number(month) }],
+      }),
+      getExpenseChartsForMonth(userId, year, month),
+      getOutgoingPaymentsGrouped(userId, start, end),
+      getDashboardEmiOverview(userId, start, end),
+    ]);
   const overview = overviews.get(yearMonthKey(year, month));
   if (!overview) return null;
 
-  const { start, end } = periodRange(year, month, "month");
-  const expenseCharts = await getExpenseChartsForMonth(userId, year, month);
   const typeNets = expenseCharts.typeNets;
   const polar_area = expenseCharts.polar_area;
-  const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
   const monthly_trend_points = collectTrendPointsFromOverviews(overviews, year);
 
   const income = overview.salary;
@@ -1453,6 +1564,8 @@ async function buildDashboard(userId, year, month, mode = "month") {
       saved_share_percentage:
         financial?.percentages?.saved_share_percentage ?? 0,
     },
+
+    emi_overview,
   };
 }
 
@@ -1478,17 +1591,26 @@ async function buildDashboardForYear(userId, year) {
   let savingsDebited = 0;
   let debtGivenNet = 0;
   let debtReceivedNet = 0;
+  let debtReceivedReturned = 0;
+  let debtReceivedRepaidThisMonth = 0;
+  let debtReceivedRepaidPastMonths = 0;
   let previous_balance = 0;
   let previous_balance_manual = false;
   let balance = 0;
   let date = null;
   const monthly_trend_points = [];
 
-  const overviews = await buildMonthOverviewsForCalendarYear(userId, year, {
-    factsSource: "summary",
-    extraMonths: [{ year: Number(year), month: 12 }],
-  });
-  const expenseCharts = await getExpenseChartsForYear(userId, year);
+  const { start, end } = periodRange(year, null, "year");
+  const [overviews, expenseCharts, payment_groups, emi_overview] =
+    await Promise.all([
+      buildMonthOverviewsForCalendarYear(userId, year, {
+        factsSource: "summary",
+        extraMonths: [{ year: Number(year), month: 12 }],
+      }),
+      getExpenseChartsForYear(userId, year),
+      getOutgoingPaymentsGrouped(userId, start, end),
+      getDashboardEmiOverview(userId, start, end),
+    ]);
   const typeNetsByMonth = expenseCharts.typeNetsByMonth;
 
   for (let m = 1; m <= 12; m++) {
@@ -1523,6 +1645,17 @@ async function buildDashboardForYear(userId, year) {
     );
     debtGivenNet = roundMoney(debtGivenNet + overview.debt_given_net);
     debtReceivedNet = roundMoney(debtReceivedNet + overview.debt_received_net);
+    debtReceivedReturned = roundMoney(
+      debtReceivedReturned + (overview.debt_received_returned || 0)
+    );
+    debtReceivedRepaidThisMonth = roundMoney(
+      debtReceivedRepaidThisMonth +
+        (overview.debt_received_repaid_this_month || 0)
+    );
+    debtReceivedRepaidPastMonths = roundMoney(
+      debtReceivedRepaidPastMonths +
+        (overview.debt_received_repaid_past_months || 0)
+    );
 
     monthly_trend_points.push({
       month: m,
@@ -1557,9 +1690,7 @@ async function buildDashboardForYear(userId, year) {
   // Remaining = Incoming + Previous − Spent − Savings − Debt
   const total_deductions = roundMoney(fromSavings + spent + debt);
 
-  const { start, end } = periodRange(year, null, "year");
   const polar_area = expenseCharts.polar_area;
-  const payment_groups = await getOutgoingPaymentsGrouped(userId, start, end);
 
   const charts = buildChartsBundle({
     polar_area,
@@ -1615,9 +1746,14 @@ async function buildDashboardForYear(userId, year) {
       outgoing_payments_total: outgoingPayments,
       debt_given_net: debtGivenNet,
       debt_received_net: debtReceivedNet,
+      debt_received_returned: debtReceivedReturned,
+      debt_received_repaid_this_month: debtReceivedRepaidThisMonth,
+      debt_received_repaid_past_months: debtReceivedRepaidPastMonths,
       total_deductions,
       total_amount_to_spend: roundMoney(income + previous_balance),
     },
+
+    emi_overview,
   };
 }
 

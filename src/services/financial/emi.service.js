@@ -43,6 +43,64 @@ function previouslyPaidFromRow(row) {
 }
 
 /**
+ * Distinct paid months for one user, optionally bounded by payment_date.
+ * `through` = inclusive period end; `before` = exclusive period start.
+ */
+async function getPaidMonthsByUserAsOf(
+  userId,
+  { through = null, before = null } = {},
+  client = db
+) {
+  const params = [userId, APP_TIMEZONE];
+  let dateFilter = "";
+  if (through != null) {
+    params.push(through);
+    dateFilter = `AND payment_date <= $${params.length}`;
+  } else if (before != null) {
+    params.push(before);
+    dateFilter = `AND payment_date < $${params.length}`;
+  }
+
+  const result = await client.query(
+    `SELECT emi_product_id,
+            ${emiPaidMonthsCountSql("$2")} AS paid_months
+     FROM payments
+     WHERE user_id = $1
+       AND emi_product_id IS NOT NULL
+       ${dateFilter}
+     GROUP BY emi_product_id`,
+    params
+  );
+  const map = new Map();
+  for (const row of result.rows) {
+    map.set(Number(row.emi_product_id), Number(row.paid_months) || 0);
+  }
+  return map;
+}
+
+/** Dashboard list: only EMIs that have started and are not already finished. */
+function emiStartedByPeriodEnd(startFrom, periodEnd) {
+  if (startFrom == null || startFrom === "") return true;
+  const startMs = new Date(startFrom).getTime();
+  const endMs = new Date(periodEnd).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return true;
+  return startMs <= endMs;
+}
+
+function emiDashboardVisibility({
+  startedByPeriodEnd = true,
+  completedBeforePeriod,
+  completedThroughPeriod,
+}) {
+  const started = startedByPeriodEnd !== false;
+  const completedBefore = Boolean(completedBeforePeriod);
+  return {
+    include: started && !completedBefore,
+    completedThisPeriod: started && Boolean(completedThroughPeriod) && !completedBefore,
+  };
+}
+
+/**
  * EMI progress fields.
  * previously_paid / already_paid = installments paid before Budget Flow tracking
  * tracked_paid_months = distinct calendar months with EMI payments
@@ -228,6 +286,9 @@ module.exports = {
   emiPaidMonthsJoinSql,
   paidCountFromRow,
   previouslyPaidFromRow,
+  getPaidMonthsByUserAsOf,
+  emiStartedByPeriodEnd,
+  emiDashboardVisibility,
   calculateEmiProgress,
   isEmiCompleted,
   COMPLETED_EMI_EDIT_MESSAGE,

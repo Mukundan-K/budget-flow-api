@@ -6,6 +6,8 @@ const {
   attachPaidMonthsToPaymentRows,
   getPaidMonthsByUser,
   isEmiCompleted,
+  emiDashboardVisibility,
+  emiStartedByPeriodEnd,
 } = require("../src/services/financial");
 
 describe("EMI distinct-month SQL", () => {
@@ -240,5 +242,60 @@ describe("EMI completion", () => {
     const selectable = products.filter((product) => !isEmiCompleted(product));
     expect(selectable).toHaveLength(1);
     expect(selectable[0].total_paid).toBe(10);
+  });
+});
+
+describe("dashboard EMI monthly visibility", () => {
+  test("Completed is only shown in the period it became complete", () => {
+    const completionMonth = emiDashboardVisibility({
+      completedBeforePeriod: false,
+      completedThroughPeriod: true,
+    });
+    const laterMonth = emiDashboardVisibility({
+      completedBeforePeriod: true,
+      completedThroughPeriod: true,
+    });
+
+    expect(completionMonth.include).toBe(true);
+    expect(completionMonth.completedThisPeriod).toBe(true);
+    expect(laterMonth.include).toBe(false);
+    expect(laterMonth.completedThisPeriod).toBe(false);
+  });
+
+  test("active EMIs remain visible when still incomplete at period end", () => {
+    const status = emiDashboardVisibility({
+      completedBeforePeriod: false,
+      completedThroughPeriod: false,
+    });
+    expect(status.include).toBe(true);
+    expect(status.completedThisPeriod).toBe(false);
+  });
+
+  test("an EMI is hidden in months before its start date", () => {
+    const periodEnd = new Date("2026-08-31T23:59:59.000Z");
+    expect(emiStartedByPeriodEnd("2026-09-01T00:00:00.000Z", periodEnd)).toBe(
+      false
+    );
+    expect(
+      emiDashboardVisibility({
+        startedByPeriodEnd: false,
+        completedBeforePeriod: false,
+        completedThroughPeriod: false,
+      }).include
+    ).toBe(false);
+  });
+
+  test("an EMI first appears once the period reaches its start date", () => {
+    const periodEnd = new Date("2026-09-30T23:59:59.000Z");
+    expect(emiStartedByPeriodEnd("2026-09-01T00:00:00.000Z", periodEnd)).toBe(
+      true
+    );
+    expect(
+      emiDashboardVisibility({
+        startedByPeriodEnd: true,
+        completedBeforePeriod: false,
+        completedThroughPeriod: false,
+      }).include
+    ).toBe(true);
   });
 });
