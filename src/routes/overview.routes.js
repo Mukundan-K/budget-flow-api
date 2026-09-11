@@ -1550,7 +1550,9 @@ async function buildDashboard(userId, year, month, mode = "month") {
       expense_total: overview.expense_total,
       outgoing_payments_total: overview.outgoing_payments_total,
       debt_given_net: overview.debt_given_net,
+      debt_given_total: overview.debt_given_total,
       debt_received_net: overview.debt_received_net,
+      debt_received_total: overview.debt_received_total,
       debt_received_returned: overview.debt_received_returned,
       debt_received_repaid_this_month:
         overview.debt_received_repaid_this_month,
@@ -1590,7 +1592,9 @@ async function buildDashboardForYear(userId, year) {
   let savingsSaved = 0;
   let savingsDebited = 0;
   let debtGivenNet = 0;
+  let debtGivenTotal = 0;
   let debtReceivedNet = 0;
+  let debtReceivedTotal = 0;
   let debtReceivedReturned = 0;
   let debtReceivedRepaidThisMonth = 0;
   let debtReceivedRepaidPastMonths = 0;
@@ -1644,7 +1648,13 @@ async function buildDashboardForYear(userId, year) {
       savingsDebited + overview.savings_amount_debited
     );
     debtGivenNet = roundMoney(debtGivenNet + overview.debt_given_net);
+    debtGivenTotal = roundMoney(
+      debtGivenTotal + (overview.debt_given_total || 0)
+    );
     debtReceivedNet = roundMoney(debtReceivedNet + overview.debt_received_net);
+    debtReceivedTotal = roundMoney(
+      debtReceivedTotal + (overview.debt_received_total || 0)
+    );
     debtReceivedReturned = roundMoney(
       debtReceivedReturned + (overview.debt_received_returned || 0)
     );
@@ -1745,7 +1755,9 @@ async function buildDashboardForYear(userId, year) {
       expense_total: expenseTotal,
       outgoing_payments_total: outgoingPayments,
       debt_given_net: debtGivenNet,
+      debt_given_total: debtGivenTotal,
       debt_received_net: debtReceivedNet,
+      debt_received_total: debtReceivedTotal,
       debt_received_returned: debtReceivedReturned,
       debt_received_repaid_this_month: debtReceivedRepaidThisMonth,
       debt_received_repaid_past_months: debtReceivedRepaidPastMonths,
