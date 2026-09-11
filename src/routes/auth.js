@@ -3,6 +3,7 @@ const passport = require("passport");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
 const authenticate = require("../middleware/authenticate");
+const { getGoogleCallbackUrl } = require("../config/googleCallback");
 const {
   createRefreshSession,
   lockSessionByJti,
@@ -46,18 +47,25 @@ function decodeRefreshClaims(refreshToken) {
   }
 }
 
-router.get(
-  "/google",
-  passport.authenticate("google", {
+router.get("/google", (req, res, next) => {
+  const callbackURL = getGoogleCallbackUrl();
+  console.log("Google callback URL being used:", callbackURL);
+
+  return passport.authenticate("google", {
     scope: ["profile", "email"],
-  })
-);
+    callbackURL,
+  })(req, res, next);
+});
 
 router.get(
   "/google/callback",
-  passport.authenticate("google", {
-    session: false,
-  }),
+  (req, res, next) => {
+    const callbackURL = getGoogleCallbackUrl();
+    return passport.authenticate("google", {
+      session: false,
+      callbackURL,
+    })(req, res, next);
+  },
   async (req, res) => {
     try {
       const { accessToken, refreshToken } = await issueTokens(req.user);

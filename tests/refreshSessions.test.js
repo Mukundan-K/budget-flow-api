@@ -84,11 +84,43 @@ describe("refresh session tokens", () => {
 
   test("Google callback URL comes from GOOGLE_CALLBACK_URL", () => {
     const previous = process.env.GOOGLE_CALLBACK_URL;
+    process.env.NODE_ENV = "development";
+    delete process.env.RENDER;
     process.env.GOOGLE_CALLBACK_URL = "http://localhost:5000/auth/google/callback";
     expect(getGoogleCallbackUrl()).toBe(
       "http://localhost:5000/auth/google/callback"
     );
     process.env.GOOGLE_CALLBACK_URL = previous;
+  });
+
+  test("local Google callback URL falls back when env is missing", () => {
+    const previousCallback = process.env.GOOGLE_CALLBACK_URL;
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousRender = process.env.RENDER;
+    delete process.env.GOOGLE_CALLBACK_URL;
+    process.env.NODE_ENV = "development";
+    delete process.env.RENDER;
+    expect(getGoogleCallbackUrl()).toBe(
+      "http://localhost:5000/auth/google/callback"
+    );
+    process.env.GOOGLE_CALLBACK_URL = previousCallback;
+    process.env.NODE_ENV = previousNodeEnv;
+    process.env.RENDER = previousRender;
+  });
+
+  test("production Google callback URL never uses localhost", () => {
+    const previousCallback = process.env.GOOGLE_CALLBACK_URL;
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousRender = process.env.RENDER;
+    process.env.NODE_ENV = "production";
+    delete process.env.RENDER;
+    process.env.GOOGLE_CALLBACK_URL = "http://localhost:5000/auth/google/callback";
+    expect(getGoogleCallbackUrl()).toBe(
+      "https://budget-flow-api.onrender.com/auth/google/callback"
+    );
+    process.env.GOOGLE_CALLBACK_URL = previousCallback;
+    process.env.NODE_ENV = previousNodeEnv;
+    process.env.RENDER = previousRender;
   });
 
   test("refresh JWT includes user id and session jti", () => {

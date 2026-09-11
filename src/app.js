@@ -4,7 +4,7 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const passport = require("passport");
 
-dotenv.config();
+dotenv.config({ path: path.join(__dirname, "../.env") });
 
 const PORT = process.env.PORT || 5000;
 
