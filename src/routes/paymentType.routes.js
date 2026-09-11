@@ -10,6 +10,10 @@ const {
   serverError,
 } = require("../utils/response");
 const {
+  isPaymentTypeInUse,
+  PAYMENT_TYPE_IN_USE_MESSAGE,
+} = require("../services/deletionGuards");
+const {
   yearMonthFromTimestamp,
   rebuildAffectedMonthlyFinancialSummaries,
 } = require("../services/financial/monthlyFinancialSummary.service");
@@ -65,6 +69,7 @@ function mapPaymentType(row) {
     flow,
     is_income: Boolean(row.is_income),
     created_at: row.created_at,
+    in_use: row.in_use === true || row.in_use === "t" || Number(row.in_use) === 1,
   };
 }
 
@@ -291,7 +296,10 @@ router.get("/", async (req, res) => {
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const result = await db.query(
-      `SELECT ${SELECT_COLS}
+      `SELECT ${SELECT_COLS},
+              EXISTS (
+                SELECT 1 FROM payments p WHERE p.payment_type_id = payment_types.id
+              ) AS in_use
        FROM payment_types
        ${whereClause}
        ORDER BY name ASC`,
@@ -422,6 +430,19 @@ router.patch("/:id", async (req, res) => {
 // Delete
 router.delete("/:id", async (req, res) => {
   try {
+    const existing = await db.query(
+      `SELECT ${SELECT_COLS} FROM payment_types WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (existing.rows.length === 0) {
+      return notFound(res, "Payment type not found");
+    }
+
+    if (await isPaymentTypeInUse(req.params.id)) {
+      return conflict(res, PAYMENT_TYPE_IN_USE_MESSAGE);
+    }
+
     const result = await db.query(
       `DELETE FROM payment_types
        WHERE id = $1
@@ -440,7 +461,7 @@ router.delete("/:id", async (req, res) => {
     );
   } catch (err) {
     if (err.code === "23503" || err.code === "23001") {
-      return conflict(res, "Cannot delete payment type that is used by payments");
+      return conflict(res, PAYMENT_TYPE_IN_USE_MESSAGE);
     }
     console.error(err);
     return serverError(res, "Error deleting payment type");

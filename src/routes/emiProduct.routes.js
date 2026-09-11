@@ -17,11 +17,16 @@ const {
   previouslyPaidFromRow,
   listEmiProductsWithPaidMonths,
   fetchEmiProductWithPaidMonths,
+  isEmiCompleted,
+  COMPLETED_EMI_EDIT_MESSAGE,
+  COMPLETED_EMI_DELETE_MESSAGE,
+  LINKED_EMI_DELETE_MESSAGE,
 } = require("../services/financial");
+const { emiHasLinkedPayments } = require("../services/deletionGuards");
 
 function mapEmiProduct(row) {
   if (!row) return row;
-  return enrichEmiProduct({
+  const mapped = enrichEmiProduct({
     id: row.id,
     user_id: row.user_id,
     product_name: row.product_name,
@@ -31,6 +36,15 @@ function mapEmiProduct(row) {
     number_of_emis: Number(row.number_of_emis),
     created_at: formatTimestamp(row.created_at) || row.created_at,
   });
+  return {
+    ...mapped,
+    has_linked_payments: paidCountFromRow(row) > 0,
+  };
+}
+
+async function loadMappedEmiProduct(id, client) {
+  const row = await fetchEmiProductWithPaidMonths(id, client);
+  return row ? mapEmiProduct(row) : null;
 }
 
 function parseInteger(value) {
@@ -141,10 +155,19 @@ router.get("/", async (req, res) => {
     }
 
     const rows = await listEmiProductsWithPaidMonths(user_id);
+    let mapped = rows.map(mapEmiProduct);
+    const selectable =
+      req.query.selectable === "true" ||
+      req.query.selectable === "1" ||
+      req.query.incomplete_only === "true" ||
+      req.query.incomplete_only === "1";
+    if (selectable) {
+      mapped = mapped.filter((product) => !isEmiCompleted(product));
+    }
 
     return success(
       res,
-      rows.map(mapEmiProduct),
+      mapped,
       "EMI products fetched successfully"
     );
   } catch (err) {
@@ -230,6 +253,11 @@ router.put("/:id", async (req, res) => {
       return forbidden(res, ownershipError);
     }
 
+    const currentProduct = await loadMappedEmiProduct(req.params.id);
+    if (currentProduct && isEmiCompleted(currentProduct)) {
+      return conflict(res, COMPLETED_EMI_EDIT_MESSAGE);
+    }
+
     const product_name = String(req.body.product_name).trim();
     const emi_start_from = parseTimestamp(
       req.body.start_date ?? req.body.emi_start_from
@@ -295,6 +323,11 @@ router.patch("/:id", async (req, res) => {
     const ownershipError = assertOwnership(current, requestedUserId);
     if (ownershipError) {
       return forbidden(res, ownershipError);
+    }
+
+    const currentProduct = await loadMappedEmiProduct(req.params.id);
+    if (currentProduct && isEmiCompleted(currentProduct)) {
+      return conflict(res, COMPLETED_EMI_EDIT_MESSAGE);
     }
 
     const product_name =
@@ -375,18 +408,16 @@ router.delete("/:id", async (req, res) => {
       return forbidden(res, ownershipError);
     }
 
-    const linked = await db.query(
-      `SELECT 1 FROM payments WHERE emi_product_id = $1 LIMIT 1`,
-      [req.params.id]
-    );
-    if (linked.rows.length > 0) {
-      return conflict(
-        res,
-        "Cannot delete EMI product that is already linked to payments"
-      );
+    const currentProduct = await loadMappedEmiProduct(req.params.id);
+    if (currentProduct && isEmiCompleted(currentProduct)) {
+      return conflict(res, COMPLETED_EMI_DELETE_MESSAGE);
     }
 
-    const mapped = mapEmiProduct({
+    if (await emiHasLinkedPayments(req.params.id)) {
+      return conflict(res, LINKED_EMI_DELETE_MESSAGE);
+    }
+
+    const mapped = currentProduct || mapEmiProduct({
       ...existing.rows[0],
       paid_months: 0,
     });

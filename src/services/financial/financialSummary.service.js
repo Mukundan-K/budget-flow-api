@@ -123,6 +123,7 @@ function enrichEmiProduct(product) {
     remaining: progress.remaining,
     emis_left: progress.emis_left,
     progress_percentage: progress.progress_percentage,
+    completed: progress.completed,
   };
 }
 

@@ -26,6 +26,10 @@ const {
   paidCountFromRow,
   previouslyPaidFromRow,
   attachPaidMonthsToPaymentRows,
+  fetchEmiProductWithPaidMonths,
+  calculateEmiProgress,
+  isEmiCompleted,
+  COMPLETED_EMI_PAYMENT_MESSAGE,
 } = require("../services/financial");
 const {
   yearMonthFromTimestamp,
@@ -122,6 +126,46 @@ function mapEmiProduct(row) {
     number_of_emis:
       row.number_of_emis != null ? Number(row.number_of_emis) : null,
   });
+}
+
+async function assertEmiAcceptsInstallment(
+  emiProductId,
+  { userId, currentEmiProductId = null, client = db } = {}
+) {
+  if (!emiProductId) return null;
+  const row = await fetchEmiProductWithPaidMonths(emiProductId, client);
+  if (!row) {
+    return { badRequest: "emi_product_id is invalid for this user" };
+  }
+  if (userId != null && String(row.user_id) !== String(userId)) {
+    return { badRequest: "emi_product_id is invalid for this user" };
+  }
+  const progress = calculateEmiProgress({
+    already_paid: previouslyPaidFromRow(row),
+    paid_months: paidCountFromRow(row),
+    number_of_emis: row.number_of_emis,
+  });
+  if (!isEmiCompleted(progress)) return null;
+  if (
+    currentEmiProductId != null &&
+    Number(currentEmiProductId) === Number(emiProductId)
+  ) {
+    return null;
+  }
+  return { conflict: COMPLETED_EMI_PAYMENT_MESSAGE };
+}
+
+function rejectEmiInstallment(res, check) {
+  if (!check) return false;
+  if (check.conflict) {
+    conflict(res, check.conflict);
+    return true;
+  }
+  if (check.badRequest) {
+    badRequest(res, check.badRequest);
+    return true;
+  }
+  return false;
 }
 
 function mapPayment(row) {
@@ -316,6 +360,10 @@ async function resolveEmiProductId(userId, body) {
         ? 0
         : Number(emi.already_paid);
 
+    if (number_of_emis > 0 && already_paid >= number_of_emis) {
+      return { error: COMPLETED_EMI_PAYMENT_MESSAGE, conflict: true };
+    }
+
     try {
       const createdProduct = await db.query(
         `INSERT INTO emi_products
@@ -408,12 +456,16 @@ router.post("/", async (req, res) => {
 
       const resolved = await resolveEmiProductId(req.body.user_id, req.body);
       if (resolved.error) {
-        if (resolved.error.includes("already exists")) {
+        if (resolved.conflict || resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
         }
         return badRequest(res, resolved.error);
       }
       emi_product_id = resolved.emi_product_id;
+      const emiCheck = await assertEmiAcceptsInstallment(emi_product_id, {
+        userId: req.body.user_id,
+      });
+      if (rejectEmiInstallment(res, emiCheck)) return;
     }
 
     const amount = toAmount(req.body.amount);
@@ -727,7 +779,7 @@ router.put("/:id", async (req, res) => {
 
       const resolved = await resolveEmiProductId(req.body.user_id, req.body);
       if (resolved.error) {
-        if (resolved.error.includes("already exists")) {
+        if (resolved.conflict || resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
         }
         return badRequest(res, resolved.error);
@@ -744,12 +796,22 @@ router.put("/:id", async (req, res) => {
     try {
       await client.query("BEGIN");
       const existing = await client.query(
-        `SELECT id, payment_date, user_id FROM payments WHERE id = $1`,
+        `SELECT id, payment_date, user_id, emi_product_id FROM payments WHERE id = $1`,
         [req.params.id]
       );
       if (existing.rows.length === 0) {
         await client.query("ROLLBACK");
         return notFound(res, "Payment not found");
+      }
+
+      const emiCheck = await assertEmiAcceptsInstallment(emi_product_id, {
+        userId: user_id,
+        currentEmiProductId: existing.rows[0].emi_product_id,
+        client,
+      });
+      if (emiCheck) {
+        await client.query("ROLLBACK");
+        if (rejectEmiInstallment(res, emiCheck)) return;
       }
 
       await client.query(
@@ -846,7 +908,7 @@ router.patch("/:id", async (req, res) => {
       }
       const resolved = await resolveEmiProductId(user_id, req.body);
       if (resolved.error) {
-        if (resolved.error.includes("already exists")) {
+        if (resolved.conflict || resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
         }
         return badRequest(res, resolved.error);
@@ -855,6 +917,12 @@ router.patch("/:id", async (req, res) => {
     } else if (!isEmiType(paymentType)) {
       emi_product_id = null;
     }
+
+    const emiCheck = await assertEmiAcceptsInstallment(emi_product_id, {
+      userId: user_id,
+      currentEmiProductId: current.emi_product_id,
+    });
+    if (rejectEmiInstallment(res, emiCheck)) return;
 
     const client = await db.connect();
     try {

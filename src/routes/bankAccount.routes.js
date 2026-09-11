@@ -9,6 +9,10 @@ const {
   conflict,
   serverError,
 } = require("../utils/response");
+const {
+  isBankAccountInUse,
+  BANK_ACCOUNT_IN_USE_MESSAGE,
+} = require("../services/deletionGuards");
 
 function parseIsActive(value) {
   if (value === undefined || value === null || value === "") return undefined;
@@ -25,6 +29,8 @@ function mapBankAccount(row) {
     name: row.name,
     is_active: Boolean(row.is_active),
     created_at: row.created_at,
+    in_use:
+      row.in_use === true || row.in_use === "t" || Number(row.in_use) === 1,
   };
 }
 
@@ -109,7 +115,12 @@ router.get("/", async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT * FROM bank_accounts
+      `SELECT bank_accounts.*,
+              EXISTS (
+                SELECT 1 FROM savings_transactions s
+                WHERE s.bank_account_id = bank_accounts.id
+              ) AS in_use
+       FROM bank_accounts
        WHERE ${conditions.join(" AND ")}
        ORDER BY name ASC`,
       params
@@ -238,6 +249,19 @@ router.patch("/:id", async (req, res) => {
 // Delete
 router.delete("/:id", async (req, res) => {
   try {
+    const existing = await db.query(
+      `SELECT * FROM bank_accounts WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (existing.rows.length === 0) {
+      return notFound(res, "Bank account not found");
+    }
+
+    if (await isBankAccountInUse(req.params.id)) {
+      return conflict(res, BANK_ACCOUNT_IN_USE_MESSAGE);
+    }
+
     const result = await db.query(
       `DELETE FROM bank_accounts WHERE id = $1 RETURNING *`,
       [req.params.id]
@@ -254,10 +278,7 @@ router.delete("/:id", async (req, res) => {
     );
   } catch (err) {
     if (err.code === "23503") {
-      return conflict(
-        res,
-        "Cannot delete bank account with existing savings transactions"
-      );
+      return conflict(res, BANK_ACCOUNT_IN_USE_MESSAGE);
     }
     console.error(err);
     return serverError(res, "Error deleting bank account");

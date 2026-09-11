@@ -272,6 +272,7 @@ describe("EMI progress", () => {
     expect(result.total).toBe(12);
     expect(result.remaining).toBe(9);
     expect(result.progress_percentage).toBe(25);
+    expect(result.completed).toBe(false);
   });
 
   test("zero total safe", () => {
@@ -289,5 +290,6 @@ describe("EMI progress", () => {
     expect(result.total_paid).toBe(16);
     expect(result.remaining).toBe(0);
     expect(result.progress_percentage).toBe(100);
+    expect(result.completed).toBe(true);
   });
 });

@@ -5,6 +5,7 @@ const {
   calculateEmiProgress,
   attachPaidMonthsToPaymentRows,
   getPaidMonthsByUser,
+  isEmiCompleted,
 } = require("../src/services/financial");
 
 describe("EMI distinct-month SQL", () => {
@@ -171,5 +172,73 @@ describe("getPaidMonthsByUser query", () => {
     const map = await getPaidMonthsByUser(3, client);
     expect(map.get(5)).toBe(2);
     expect(map.get(99)).toBeUndefined();
+  });
+});
+
+describe("EMI completion", () => {
+  test("24/24 is completed", () => {
+    const progress = calculateEmiProgress({
+      already_paid: 24,
+      paid_months: 0,
+      number_of_emis: 24,
+    });
+    expect(progress.total_paid).toBe(24);
+    expect(progress.completed).toBe(true);
+    expect(isEmiCompleted(progress)).toBe(true);
+  });
+
+  test("23/24 is incomplete", () => {
+    const progress = calculateEmiProgress({
+      already_paid: 23,
+      paid_months: 0,
+      number_of_emis: 24,
+    });
+    expect(progress.total_paid).toBe(23);
+    expect(progress.completed).toBe(false);
+    expect(isEmiCompleted(progress)).toBe(false);
+  });
+
+  test("previously paid 8 + tracked 16 = 24 completed", () => {
+    const progress = calculateEmiProgress({
+      already_paid: 8,
+      paid_months: 16,
+      number_of_emis: 24,
+    });
+    expect(progress.previously_paid).toBe(8);
+    expect(progress.tracked_paid_months).toBe(16);
+    expect(progress.total_paid).toBe(24);
+    expect(progress.remaining).toBe(0);
+    expect(progress.completed).toBe(true);
+  });
+
+  test("two payments in the same month still count as one installment", () => {
+    const trackedMonths = new Set(["2026-03", "2026-03"]).size;
+    expect(trackedMonths).toBe(1);
+
+    const progress = calculateEmiProgress({
+      already_paid: 8,
+      paid_months: trackedMonths,
+      number_of_emis: 24,
+    });
+    expect(progress.total_paid).toBe(9);
+    expect(progress.completed).toBe(false);
+  });
+
+  test("selectable EMI list excludes completed products", () => {
+    const products = [
+      calculateEmiProgress({
+        already_paid: 8,
+        paid_months: 16,
+        number_of_emis: 24,
+      }),
+      calculateEmiProgress({
+        already_paid: 10,
+        paid_months: 0,
+        number_of_emis: 24,
+      }),
+    ];
+    const selectable = products.filter((product) => !isEmiCompleted(product));
+    expect(selectable).toHaveLength(1);
+    expect(selectable[0].total_paid).toBe(10);
   });
 });

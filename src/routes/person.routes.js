@@ -9,6 +9,10 @@ const {
   conflict,
   serverError,
 } = require("../utils/response");
+const {
+  isPersonInUse,
+  PERSON_IN_USE_MESSAGE,
+} = require("../services/deletionGuards");
 
 function mapPerson(row) {
   return {
@@ -16,6 +20,7 @@ function mapPerson(row) {
     user_id: row.user_id,
     name: row.name,
     created_at: row.created_at,
+    in_use: row.in_use === true || row.in_use === "t" || Number(row.in_use) === 1,
   };
 }
 
@@ -74,7 +79,11 @@ router.get("/", async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT * FROM persons
+      `SELECT persons.*,
+              EXISTS (
+                SELECT 1 FROM debts d WHERE d.person_id = persons.id
+              ) AS in_use
+       FROM persons
        WHERE user_id = $1
        ORDER BY name ASC`,
       [user_id]
@@ -186,6 +195,19 @@ router.patch("/:id", async (req, res) => {
 // Delete
 router.delete("/:id", async (req, res) => {
   try {
+    const existing = await db.query(
+      `SELECT * FROM persons WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (existing.rows.length === 0) {
+      return notFound(res, "Person not found");
+    }
+
+    if (await isPersonInUse(req.params.id)) {
+      return conflict(res, PERSON_IN_USE_MESSAGE);
+    }
+
     const result = await db.query(
       `DELETE FROM persons WHERE id = $1 RETURNING *`,
       [req.params.id]
@@ -202,7 +224,7 @@ router.delete("/:id", async (req, res) => {
     );
   } catch (err) {
     if (err.code === "23503") {
-      return conflict(res, "Cannot delete person that is used by debts");
+      return conflict(res, PERSON_IN_USE_MESSAGE);
     }
     console.error(err);
     return serverError(res, "Error deleting person");

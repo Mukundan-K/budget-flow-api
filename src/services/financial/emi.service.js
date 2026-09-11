@@ -84,6 +84,8 @@ function calculateEmiProgress({
   const progress_percentage =
     totalCount > 0 ? safePercentage(totalPaid, totalCount, { clamp: true }) : 0;
 
+  const completed = totalCount > 0 && totalPaid >= totalCount;
+
   return {
     paid: totalPaid,
     total_paid: totalPaid,
@@ -95,8 +97,28 @@ function calculateEmiProgress({
     remaining,
     emis_left: remaining,
     progress_percentage,
+    completed,
   };
 }
+
+function isEmiCompleted(progress) {
+  if (!progress) return false;
+  if (typeof progress.completed === "boolean") return progress.completed;
+  const total = Number(progress.number_of_emis);
+  if (!Number.isFinite(total) || total <= 0) return false;
+  const paid = Number(
+    progress.total_paid != null ? progress.total_paid : progress.paid
+  );
+  return Number.isFinite(paid) && paid >= total;
+}
+
+const COMPLETED_EMI_EDIT_MESSAGE = "Completed EMI cannot be edited.";
+const COMPLETED_EMI_DELETE_MESSAGE =
+  "Completed EMI cannot be deleted because all installments have been paid.";
+const COMPLETED_EMI_PAYMENT_MESSAGE =
+  "This EMI is already fully paid and cannot receive another installment.";
+const LINKED_EMI_DELETE_MESSAGE =
+  "This EMI is already linked to one or more payments. Please remove or update the linked payments before deleting it.";
 
 async function getPaidMonthsByUser(userId, client = db) {
   const result = await client.query(
@@ -207,6 +229,11 @@ module.exports = {
   paidCountFromRow,
   previouslyPaidFromRow,
   calculateEmiProgress,
+  isEmiCompleted,
+  COMPLETED_EMI_EDIT_MESSAGE,
+  COMPLETED_EMI_DELETE_MESSAGE,
+  COMPLETED_EMI_PAYMENT_MESSAGE,
+  LINKED_EMI_DELETE_MESSAGE,
   getPaidMonthsByUser,
   getPaidMonthsForUsers,
   attachPaidMonthsToPaymentRows,

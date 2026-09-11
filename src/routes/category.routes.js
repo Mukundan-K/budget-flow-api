@@ -9,6 +9,10 @@ const {
   conflict,
   serverError,
 } = require("../utils/response");
+const {
+  isCategoryInUse,
+  CATEGORY_IN_USE_MESSAGE,
+} = require("../services/deletionGuards");
 
 function readBody(req) {
   return req.body && typeof req.body === "object" ? req.body : {};
@@ -28,6 +32,7 @@ function mapCategory(row) {
   return {
     id: row.id,
     name: row.name,
+    in_use: row.in_use === true || row.in_use === "t" || Number(row.in_use) === 1,
   };
 }
 
@@ -110,14 +115,27 @@ router.get("/", async (req, res) => {
     let result;
     if (search) {
       result = await db.query(
-        `SELECT id, name FROM categories
+        `SELECT id, name,
+                (
+                  EXISTS (SELECT 1 FROM expenses e WHERE e.category = categories.name)
+                  OR EXISTS (SELECT 1 FROM expense_category_splits s WHERE s.category = categories.name)
+                  OR EXISTS (SELECT 1 FROM expense_returns r WHERE r.category = categories.name)
+                ) AS in_use
+         FROM categories
          WHERE name ILIKE $1
          ORDER BY name ASC`,
         [`%${search}%`]
       );
     } else {
       result = await db.query(
-        `SELECT id, name FROM categories ORDER BY name ASC`
+        `SELECT id, name,
+                (
+                  EXISTS (SELECT 1 FROM expenses e WHERE e.category = categories.name)
+                  OR EXISTS (SELECT 1 FROM expense_category_splits s WHERE s.category = categories.name)
+                  OR EXISTS (SELECT 1 FROM expense_returns r WHERE r.category = categories.name)
+                ) AS in_use
+         FROM categories
+         ORDER BY name ASC`
       );
     }
 
@@ -136,7 +154,13 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, name FROM categories WHERE id = $1`,
+      `SELECT id, name,
+              (
+                EXISTS (SELECT 1 FROM expenses e WHERE e.category = categories.name)
+                OR EXISTS (SELECT 1 FROM expense_category_splits s WHERE s.category = categories.name)
+                OR EXISTS (SELECT 1 FROM expense_returns r WHERE r.category = categories.name)
+              ) AS in_use
+       FROM categories WHERE id = $1`,
       [req.params.id]
     );
 
@@ -158,6 +182,19 @@ router.patch("/:id", updateCategory);
 // Delete category — 200
 router.delete("/:id", async (req, res) => {
   try {
+    const existing = await db.query(
+      `SELECT id, name FROM categories WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (existing.rows.length === 0) {
+      return notFound(res, "Category not found");
+    }
+
+    if (await isCategoryInUse(existing.rows[0].name)) {
+      return conflict(res, CATEGORY_IN_USE_MESSAGE);
+    }
+
     const result = await db.query(
       `DELETE FROM categories WHERE id = $1 RETURNING id, name`,
       [req.params.id]
