@@ -124,6 +124,12 @@ async function seedPayments() {
         ON payments (user_id, payment_date)
     `);
 
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_payments_user_emi_date
+        ON payments (user_id, emi_product_id, payment_date)
+        WHERE emi_product_id IS NOT NULL
+    `);
+
     await migrateColumnToTimestamptz("payments", "payment_date");
     await migrateColumnToTimestamptz("emi_products", "emi_start_from");
     await migrateColumnToNumeric("payments", "amount");

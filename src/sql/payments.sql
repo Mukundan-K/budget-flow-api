@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_user_date
   ON payments (user_id, payment_date);
 
+CREATE INDEX IF NOT EXISTS idx_payments_user_emi_date
+  ON payments (user_id, emi_product_id, payment_date)
+  WHERE emi_product_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS monthly_balances (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

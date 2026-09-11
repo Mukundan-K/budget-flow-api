@@ -20,6 +20,9 @@ const {
   calculatePaymentAmounts,
   calculateExpenseAmounts,
   enrichEmiProduct,
+  paidCountFromRow,
+  previouslyPaidFromRow,
+  attachPaidMonthsToPaymentRows,
   buildActivityMonthFinancials,
   calculateSavingsNet,
 } = require("../services/financial");
@@ -61,7 +64,8 @@ function mapEmiProduct(row) {
     id: row.emi_product_id,
     product_name: row.emi_product_name,
     start_date: formatTimestamp(row.emi_start_from),
-    already_paid: row.already_paid != null ? Number(row.already_paid) : 0,
+    already_paid: previouslyPaidFromRow(row),
+    paid_months: paidCountFromRow(row),
     number_of_emis:
       row.number_of_emis != null ? Number(row.number_of_emis) : null,
   });
@@ -546,7 +550,10 @@ router.get("/", async (req, res) => {
       ),
     ]);
 
-    const payments = paymentsResult.rows.map(mapPayment);
+    const paymentsWithPaid = await attachPaidMonthsToPaymentRows(
+      paymentsResult.rows
+    );
+    const payments = paymentsWithPaid.map(mapPayment);
     const expenses = await mapExpensesWithSplits(expensesResult.rows);
 
     const buckets = buildMonthBuckets(period.year, period.month);

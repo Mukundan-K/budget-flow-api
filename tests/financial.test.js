@@ -278,4 +278,16 @@ describe("EMI progress", () => {
     const result = calculateEmiProgress({ already_paid: 0, number_of_emis: 0 });
     expect(result.progress_percentage).toBe(0);
   });
+
+  test("remaining is never negative when paid exceeds total", () => {
+    const result = calculateEmiProgress({
+      already_paid: 8,
+      paid_months: 8,
+      number_of_emis: 14,
+    });
+    expect(result.already_paid).toBe(8);
+    expect(result.total_paid).toBe(16);
+    expect(result.remaining).toBe(0);
+    expect(result.progress_percentage).toBe(100);
+  });
 });

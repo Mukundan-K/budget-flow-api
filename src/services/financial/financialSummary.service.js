@@ -107,11 +107,18 @@ function enrichEmiProduct(product) {
   if (!product) return product;
   const progress = calculateEmiProgress({
     already_paid: product.already_paid,
+    previously_paid: product.previously_paid,
+    tracked_paid_months: product.tracked_paid_months,
+    paid_months: product.paid_months,
     number_of_emis: product.number_of_emis,
   });
   return {
     ...product,
+    already_paid: progress.already_paid,
+    previously_paid: progress.previously_paid,
+    tracked_paid_months: progress.tracked_paid_months,
     paid: progress.paid,
+    total_paid: progress.total_paid,
     total: progress.total,
     remaining: progress.remaining,
     emis_left: progress.emis_left,

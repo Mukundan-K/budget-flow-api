@@ -49,7 +49,6 @@ function decodeRefreshClaims(refreshToken) {
 
 router.get("/google", (req, res, next) => {
   const callbackURL = getGoogleCallbackUrl();
-  console.log("Google callback URL being used:", callbackURL);
 
   return passport.authenticate("google", {
     scope: ["profile", "email"],

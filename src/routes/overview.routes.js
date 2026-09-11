@@ -19,6 +19,9 @@ const {
   calculateMonthlyBalance,
   buildDashboardFinancialBlock,
   enrichEmiProduct,
+  paidCountFromRow,
+  previouslyPaidFromRow,
+  emiPaidMonthsJoinSql,
   pct: sharePct,
 } = require("../services/financial");
 const {
@@ -661,12 +664,14 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
        ep.product_name AS emi_product_name,
        ep.emi_start_from,
        ep.already_paid,
+       COALESCE(emi_paid.paid_months, 0) AS paid_months,
        ep.number_of_emis,
        COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total,
        COUNT(p.id)::int AS count
      FROM payments p
      JOIN payment_types pt ON pt.id = p.payment_type_id
      LEFT JOIN emi_products ep ON ep.id = p.emi_product_id
+     ${emiPaidMonthsJoinSql({ userParam: "$1", tzParam: "$4" })}
      LEFT JOIN (
        SELECT payment_id, SUM(amount) AS returned_amount
        FROM payment_returns
@@ -683,10 +688,11 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
        ep.product_name,
        ep.emi_start_from,
        ep.already_paid,
+       emi_paid.paid_months,
        ep.number_of_emis
      HAVING COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) > 0
      ORDER BY total DESC`,
-    [userId, start, end]
+    [userId, start, end, APP_TIMEZONE]
   );
 
   const byType = {};
@@ -714,12 +720,11 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
     group.count += count;
 
     if (isEmi) {
-      const already_paid =
-        row.already_paid != null ? Number(row.already_paid) : 0;
       const number_of_emis =
         row.number_of_emis != null ? Number(row.number_of_emis) : null;
       const emiProgress = enrichEmiProduct({
-        already_paid,
+        already_paid: previouslyPaidFromRow(row),
+        paid_months: paidCountFromRow(row),
         number_of_emis,
       });
 
@@ -729,9 +734,11 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
         emi_product_id: row.emi_product_id || null,
         start_date: formatTimestamp(row.emi_start_from),
         already_paid: emiProgress.already_paid,
+        previously_paid: emiProgress.previously_paid,
+        tracked_paid_months: emiProgress.tracked_paid_months,
         number_of_emis: emiProgress.number_of_emis,
         paid: emiProgress.paid,
-        total: emiProgress.total,
+        total_paid: emiProgress.total_paid,
         remaining: emiProgress.remaining,
         emis_left: emiProgress.emis_left,
         progress_percentage: emiProgress.progress_percentage,

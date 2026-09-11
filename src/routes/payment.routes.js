@@ -23,6 +23,9 @@ const {
 const {
   calculatePaymentAmounts,
   enrichEmiProduct,
+  paidCountFromRow,
+  previouslyPaidFromRow,
+  attachPaidMonthsToPaymentRows,
 } = require("../services/financial");
 const {
   yearMonthFromTimestamp,
@@ -114,7 +117,8 @@ function mapEmiProduct(row) {
     id: row.emi_product_id,
     product_name: row.emi_product_name,
     start_date: formatTimestamp(row.emi_start_from),
-    already_paid: row.already_paid != null ? Number(row.already_paid) : 0,
+    already_paid: previouslyPaidFromRow(row),
+    paid_months: paidCountFromRow(row),
     number_of_emis:
       row.number_of_emis != null ? Number(row.number_of_emis) : null,
   });
@@ -199,108 +203,139 @@ function validatePaymentPayload(body, { partial = false } = {}) {
   return errors;
 }
 
-function validateEmiPayload(emi) {
+function getEmiMode(emi) {
+  if (!emi || typeof emi !== "object") return "";
+  return String(emi.mode || "").trim().toLowerCase();
+}
+
+function getRequestedEmiProductId(body) {
+  if (
+    body.emi_product_id !== undefined &&
+    body.emi_product_id !== null &&
+    body.emi_product_id !== ""
+  ) {
+    return body.emi_product_id;
+  }
+  if (body.emi && typeof body.emi === "object") {
+    const nestedId = body.emi.emi_product_id;
+    if (nestedId !== undefined && nestedId !== null && nestedId !== "") {
+      return nestedId;
+    }
+  }
+  return null;
+}
+
+function validateNewEmiPayload(emi) {
   const errors = [];
 
-  if (!emi || typeof emi !== "object") {
-    return ["emi details are required for EMI payments"];
+  if (!emi.product_name || String(emi.product_name).trim() === "") {
+    errors.push("emi.product_name is required for new EMI");
   }
 
-  const mode = String(emi.mode || "").trim().toLowerCase();
-  if (mode !== "existing" && mode !== "new") {
-    errors.push("emi.mode must be 'existing' or 'new'");
-    return errors;
+  const startDate = emi.start_date || emi.emi_start_from;
+  if (!startDate) {
+    errors.push("emi.start_date is required for new EMI");
+  } else if (parseTimestamp(startDate) === null) {
+    errors.push("emi.start_date must be a valid date or timestamp");
   }
 
-  if (mode === "existing") {
-    if (
-      emi.emi_product_id === undefined ||
-      emi.emi_product_id === null ||
-      emi.emi_product_id === ""
-    ) {
-      errors.push("emi.emi_product_id is required for existing EMI");
-    }
+  const count = Number(emi.number_of_emis);
+  if (
+    emi.number_of_emis === undefined ||
+    emi.number_of_emis === null ||
+    emi.number_of_emis === ""
+  ) {
+    errors.push("emi.number_of_emis is required for new EMI");
+  } else if (!Number.isInteger(count) || count <= 0) {
+    errors.push("emi.number_of_emis must be a positive integer");
   }
 
-  if (mode === "new") {
-    if (!emi.product_name || String(emi.product_name).trim() === "") {
-      errors.push("emi.product_name is required for new EMI");
-    }
-
-    const startDate = emi.start_date || emi.emi_start_from;
-    if (!startDate) {
-      errors.push("emi.start_date is required for new EMI");
-    } else if (parseTimestamp(startDate) === null) {
-      errors.push("emi.start_date must be a valid date or timestamp");
-    }
-
-    const count = Number(emi.number_of_emis);
-    if (
-      emi.number_of_emis === undefined ||
-      emi.number_of_emis === null ||
-      emi.number_of_emis === ""
-    ) {
-      errors.push("emi.number_of_emis is required for new EMI");
-    } else if (!Number.isInteger(count) || count <= 0) {
-      errors.push("emi.number_of_emis must be a positive integer");
-    }
-
-    if (
-      emi.already_paid === undefined ||
-      emi.already_paid === null ||
-      emi.already_paid === ""
-    ) {
-      errors.push("emi.already_paid is required for new EMI");
-    } else {
-      const paid = Number(emi.already_paid);
-      if (!Number.isInteger(paid) || paid < 0) {
-        errors.push("emi.already_paid must be an integer >= 0");
-      } else if (Number.isInteger(count) && count > 0 && paid > count) {
-        errors.push("emi.already_paid cannot be greater than number_of_emis");
-      }
+  if (
+    emi.already_paid !== undefined &&
+    emi.already_paid !== null &&
+    emi.already_paid !== ""
+  ) {
+    const paid = Number(emi.already_paid);
+    if (!Number.isInteger(paid) || paid < 0) {
+      errors.push("emi.already_paid must be an integer >= 0");
+    } else if (Number.isInteger(count) && count > 0 && paid > count) {
+      errors.push("emi.already_paid cannot be greater than number_of_emis");
     }
   }
 
   return errors;
 }
 
-async function resolveEmiProductId(userId, emi) {
-  const mode = String(emi.mode).trim().toLowerCase();
+function validateEmiPayload(body) {
+  const emi = body.emi;
+  const mode = getEmiMode(emi);
 
-  if (mode === "existing") {
-    const existing = await db.query(
-      `SELECT id FROM emi_products
-       WHERE id = $1 AND user_id = $2`,
-      [emi.emi_product_id, userId]
-    );
-    if (existing.rows.length === 0) {
-      return { error: "emi_product_id is invalid for this user" };
+  // Legacy clients may still create EMI products inline.
+  if (mode === "new") {
+    if (!emi || typeof emi !== "object") {
+      return ["emi details are required for EMI payments"];
     }
-    return { emi_product_id: existing.rows[0].id };
+    return validateNewEmiPayload(emi);
   }
 
-  const product_name = String(emi.product_name).trim();
-  const emi_start_from = parseTimestamp(emi.start_date || emi.emi_start_from);
-  const number_of_emis = Number(emi.number_of_emis);
-  const already_paid = Number(emi.already_paid);
-
-  try {
-    const createdProduct = await db.query(
-      `INSERT INTO emi_products
-         (user_id, product_name, emi_start_from, already_paid, number_of_emis)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [userId, product_name, emi_start_from, already_paid, number_of_emis]
-    );
-    return { emi_product_id: createdProduct.rows[0].id };
-  } catch (err) {
-    if (err.code === "23505") {
-      return {
-        error: "EMI product with this name already exists for the user",
-      };
-    }
-    throw err;
+  if (mode && mode !== "existing") {
+    return ["emi.mode must be 'existing' or 'new'"];
   }
+
+  if (getRequestedEmiProductId(body) === null) {
+    return ["emi_product_id is required for EMI payments"];
+  }
+
+  return [];
+}
+
+async function resolveExistingEmiProductId(userId, emiProductId) {
+  const existing = await db.query(
+    `SELECT id FROM emi_products
+     WHERE id = $1 AND user_id = $2`,
+    [emiProductId, userId]
+  );
+  if (existing.rows.length === 0) {
+    return { error: "emi_product_id is invalid for this user" };
+  }
+  return { emi_product_id: existing.rows[0].id };
+}
+
+async function resolveEmiProductId(userId, body) {
+  const emi = body.emi;
+  const mode = getEmiMode(emi);
+
+  if (mode === "new") {
+    const product_name = String(emi.product_name).trim();
+    const emi_start_from = parseTimestamp(emi.start_date || emi.emi_start_from);
+    const number_of_emis = Number(emi.number_of_emis);
+    const already_paid =
+      emi.already_paid === undefined ||
+      emi.already_paid === null ||
+      emi.already_paid === ""
+        ? 0
+        : Number(emi.already_paid);
+
+    try {
+      const createdProduct = await db.query(
+        `INSERT INTO emi_products
+           (user_id, product_name, emi_start_from, already_paid, number_of_emis)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [userId, product_name, emi_start_from, already_paid, number_of_emis]
+      );
+      return { emi_product_id: createdProduct.rows[0].id };
+    } catch (err) {
+      if (err.code === "23505") {
+        return {
+          error: "EMI product with this name already exists for the user",
+        };
+      }
+      throw err;
+    }
+  }
+
+  return resolveExistingEmiProductId(userId, getRequestedEmiProductId(body));
 }
 
 const PAYMENT_SELECT = `
@@ -336,7 +371,14 @@ async function fetchMappedPayment(client, paymentId) {
   const result = await client.query(`${PAYMENT_SELECT} WHERE p.id = $1`, [
     paymentId,
   ]);
-  return result.rows[0] ? mapPayment(result.rows[0]) : null;
+  if (!result.rows[0]) return null;
+  const [mapped] = await attachPaidMonthsToPaymentRows(result.rows, client);
+  return mapPayment(mapped);
+}
+
+async function mapPayments(rows, client = db) {
+  const withPaid = await attachPaidMonthsToPaymentRows(rows, client);
+  return withPaid.map(mapPayment);
 }
 
 // Create payment (salary, rent, EMI, etc.)
@@ -359,12 +401,12 @@ router.post("/", async (req, res) => {
     let emi_product_id = null;
 
     if (isEmiType(paymentType)) {
-      const emiErrors = validateEmiPayload(req.body.emi);
+      const emiErrors = validateEmiPayload(req.body);
       if (emiErrors.length) {
         return badRequest(res, emiErrors.join(", "));
       }
 
-      const resolved = await resolveEmiProductId(req.body.user_id, req.body.emi);
+      const resolved = await resolveEmiProductId(req.body.user_id, req.body);
       if (resolved.error) {
         if (resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
@@ -459,7 +501,7 @@ router.get("/", async (req, res) => {
 
     return success(
       res,
-      result.rows.map(mapPayment),
+      await mapPayments(result.rows),
       "Payments fetched successfully"
     );
   } catch (err) {
@@ -485,10 +527,12 @@ router.get("/:id/returns", async (req, res) => {
       [req.params.id]
     );
 
+    const [mappedPayment] = await mapPayments(payment.rows);
+
     return success(
       res,
       {
-        payment: mapPayment(payment.rows[0]),
+        payment: mappedPayment,
         returns: result.rows.map(mapPaymentReturn),
       },
       "Payment returns fetched successfully"
@@ -640,10 +684,12 @@ router.get("/:id", async (req, res) => {
       [req.params.id]
     );
 
+    const [mappedPayment] = await mapPayments(result.rows);
+
     return success(
       res,
       {
-        ...mapPayment(result.rows[0]),
+        ...mappedPayment,
         returns: returns.rows.map(mapPaymentReturn),
       },
       "Payment fetched successfully"
@@ -674,12 +720,12 @@ router.put("/:id", async (req, res) => {
     let emi_product_id = null;
 
     if (isEmiType(paymentType)) {
-      const emiErrors = validateEmiPayload(req.body.emi);
+      const emiErrors = validateEmiPayload(req.body);
       if (emiErrors.length) {
         return badRequest(res, emiErrors.join(", "));
       }
 
-      const resolved = await resolveEmiProductId(req.body.user_id, req.body.emi);
+      const resolved = await resolveEmiProductId(req.body.user_id, req.body);
       if (resolved.error) {
         if (resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
@@ -790,12 +836,15 @@ router.patch("/:id", async (req, res) => {
     }
 
     const paymentType = typeCheck.rows[0];
-    if (isEmiType(paymentType) && req.body.emi !== undefined) {
-      const emiErrors = validateEmiPayload(req.body.emi);
+    if (
+      isEmiType(paymentType) &&
+      (req.body.emi !== undefined || req.body.emi_product_id !== undefined)
+    ) {
+      const emiErrors = validateEmiPayload(req.body);
       if (emiErrors.length) {
         return badRequest(res, emiErrors.join(", "));
       }
-      const resolved = await resolveEmiProductId(user_id, req.body.emi);
+      const resolved = await resolveEmiProductId(user_id, req.body);
       if (resolved.error) {
         if (resolved.error.includes("already exists")) {
           return conflict(res, resolved.error);
@@ -883,11 +932,12 @@ router.delete("/:id", async (req, res) => {
       [paymentSummaryTarget(existing.rows[0])],
       client
     );
+    const [mapped] = await mapPayments(existing.rows, client);
     await client.query("COMMIT");
 
     return success(
       res,
-      mapPayment(existing.rows[0]),
+      mapped,
       "Payment deleted successfully"
     );
   } catch (err) {

@@ -137,6 +137,13 @@ CREATE TABLE IF NOT EXISTS payments (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_payments_user_date
+  ON payments (user_id, payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_payments_user_emi_date
+  ON payments (user_id, emi_product_id, payment_date)
+  WHERE emi_product_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS payment_returns (
   id SERIAL PRIMARY KEY,
   payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
