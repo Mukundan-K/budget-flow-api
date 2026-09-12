@@ -89,10 +89,9 @@ function profileCount(profile, name) {
  * Current dashboard SQL contract (month or year mode):
  * - one combined expense-charts query (not polar + type-net helpers)
  * - summary facts, not per-month source facts
- * - two Monthly Debt Trend queries (opening + year buckets)
  * - selected-month live overlay: salary date, EMI stats, debt repaid split
  * - EMI overview: products + period payments + paid-months before/through
- * Total 14 queries for a year that already has activity.
+ * Total 13 queries for a year that already has activity.
  */
 function expectDashboardQueryContract(profile) {
   expect(profileCount(profile, "expense_charts")).toBe(1);
@@ -104,15 +103,16 @@ function expectDashboardQueryContract(profile) {
   expect(profileCount(profile, "monthly_balances")).toBe(1);
   expect(profileCount(profile, "activity_range")).toBe(1);
   expect(profileCount(profile, "outgoing_payment_groups")).toBe(1);
-  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(1);
-  expect(profileCount(profile, "monthly_debt_trend")).toBe(1);
+  expect(profileCount(profile, "payment_type_groups")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(0);
+  expect(profileCount(profile, "monthly_debt_trend")).toBe(0);
   expect(profileCount(profile, "latest_salary")).toBe(1);
   expect(profileCount(profile, "emi_stats")).toBe(1);
   expect(profileCount(profile, "debt_originated")).toBe(1);
   expect(profileCount(profile, "emi_products")).toBe(1);
   expect(profileCount(profile, "emi_period_payments")).toBe(1);
   expect(profileCount(profile, "emi_paid_months")).toBe(2);
-  expect(profile.queryCount).toBe(14);
+  expect(profile.queryCount).toBe(13);
 }
 
 describe("getExpenseTypeNetsForYear matches 12 monthly queries", () => {

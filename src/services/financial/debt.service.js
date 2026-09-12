@@ -65,69 +65,6 @@ function calculatePersonBalances({
   };
 }
 
-function formatDebtYearMonth(year, month) {
-  return `${Number(year)}-${String(Number(month)).padStart(2, "0")}`;
-}
-
-/**
- * Month-end outstanding using the same rules as Debt Overview:
- * I Owe Them / They Owe Me / Net Debt. Negatives are preserved.
- */
-function monthlyDebtTrendPoint(year, month, totals = {}) {
-  const balances = calculatePersonBalances(totals);
-  return {
-    month: formatDebtYearMonth(year, month),
-    year: Number(year),
-    month_number: Number(month),
-    i_owe_them: balances.i_owe_them,
-    they_owe_me: balances.they_owe_me,
-    net_debt: balances.net_amount,
-    iOweThem: balances.i_owe_them,
-    theyOweMe: balances.they_owe_me,
-    netDebt: balances.net_amount,
-  };
-}
-
-function emptyDebtTotals() {
-  return {
-    received_total: 0,
-    returned_by_me: 0,
-    given_total: 0,
-    returned_to_me: 0,
-  };
-}
-
-function addDebtTotals(base = {}, extra = {}) {
-  return {
-    received_total: roundMoney(
-      toAmount(base.received_total) + toAmount(extra.received_total)
-    ),
-    returned_by_me: roundMoney(
-      toAmount(base.returned_by_me) + toAmount(extra.returned_by_me)
-    ),
-    given_total: roundMoney(
-      toAmount(base.given_total) + toAmount(extra.given_total)
-    ),
-    returned_to_me: roundMoney(
-      toAmount(base.returned_to_me) + toAmount(extra.returned_to_me)
-    ),
-  };
-}
-
-/**
- * 12 month-end balances for a year. Each month carries forward prior
- * outstanding, matching Debt Overview at year-end when all history is included.
- */
-function fillMonthlyDebtTrendYear(year, byMonth = new Map(), opening = {}) {
-  let running = addDebtTotals(emptyDebtTotals(), opening);
-  const points = [];
-  for (let month = 1; month <= 12; month++) {
-    running = addDebtTotals(running, byMonth.get(month) || emptyDebtTotals());
-    points.push(monthlyDebtTrendPoint(year, month, running));
-  }
-  return points;
-}
-
 function calculateDebtSummary({
   given_total = 0,
   given_returned = 0,
@@ -175,6 +112,4 @@ module.exports = {
   calculateDebtNet,
   calculateDebtSummary,
   calculatePersonBalances,
-  monthlyDebtTrendPoint,
-  fillMonthlyDebtTrendYear,
 };

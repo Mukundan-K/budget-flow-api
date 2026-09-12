@@ -112,15 +112,16 @@ function expectDashboardQueryContract(profile) {
   expect(profileCount(profile, "monthly_balances")).toBe(1);
   expect(profileCount(profile, "activity_range")).toBe(1);
   expect(profileCount(profile, "outgoing_payment_groups")).toBe(1);
-  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(1);
-  expect(profileCount(profile, "monthly_debt_trend")).toBe(1);
+  expect(profileCount(profile, "payment_type_groups")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(0);
+  expect(profileCount(profile, "monthly_debt_trend")).toBe(0);
   expect(profileCount(profile, "latest_salary")).toBe(1);
   expect(profileCount(profile, "emi_stats")).toBe(1);
   expect(profileCount(profile, "debt_originated")).toBe(1);
   expect(profileCount(profile, "emi_products")).toBe(1);
   expect(profileCount(profile, "emi_period_payments")).toBe(1);
   expect(profileCount(profile, "emi_paid_months")).toBe(2);
-  expect(profile.queryCount).toBe(14);
+  expect(profile.queryCount).toBe(13);
 }
 
 describe("combined expense charts match polar + type-net helpers", () => {
@@ -354,15 +355,21 @@ describe("combined expense charts match polar + type-net helpers", () => {
     expect(dashboard.from_savings).toEqual(expect.any(Number));
     expect(dashboard.debt).toEqual(expect.any(Number));
     expect(dashboard.charts.monthly_trend.points).toHaveLength(12);
-    expect(dashboard.charts.monthly_debt_trend.points).toHaveLength(12);
-    expect(dashboard.charts.monthly_debt_trend.series.map((s) => s.name)).toEqual([
-      "I Owe Them",
-      "They Owe Me",
+    expect(dashboard.charts.monthly_trend.series.map((s) => s.key)).toEqual([
+      "earned",
+      "spent",
+      "from_savings",
+      "balance",
     ]);
+    expect(dashboard.charts.payments_by_type.title).toBe("Payments by Type");
+    expect(dashboard.charts.payments_by_type.labels).toEqual([]);
+    expect(dashboard.charts.payments_by_type.items).toEqual([]);
+    expect(dashboard.charts.monthly_debt_trend).toBeUndefined();
     expect(dashboard.charts.spending_breakdown).toBeTruthy();
     expect(dashboard.charts.expense_type).toBeTruthy();
     expect(dashboard.emi_overview.products).toEqual([]);
     expect(dashboard.emi_overview.paid_this_period).toBe(0);
+    expect(dashboard.emi_overview.remaining_emis).toBe(0);
   });
 
   test("year dashboard polar and type nets match old helpers", async () => {
@@ -386,8 +393,9 @@ describe("combined expense charts match polar + type-net helpers", () => {
       expect(point.necessary).toBe(monthNets.necessary);
       expect(point.unnecessary).toBe(monthNets.unnecessary);
     });
-    expect(dashboard.charts.monthly_debt_trend.series).toHaveLength(2);
-    expect(dashboard.charts.monthly_debt_trend.points).toHaveLength(12);
+    expect(dashboard.charts.monthly_debt_trend).toBeUndefined();
+    expect(dashboard.charts.payments_by_type.items).toEqual([]);
+    expect(dashboard.charts.monthly_trend.series.map((s) => s.key)).not.toContain("debt");
   });
 
   test("month and year dashboards issue one combined expense-chart query and the current dashboard read set", async () => {

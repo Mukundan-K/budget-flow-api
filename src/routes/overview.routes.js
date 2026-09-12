@@ -30,7 +30,6 @@ const {
 } = require("../services/financial");
 const {
   getDebtMonthNetForMonth,
-  getMonthlyDebtTrendForYear,
 } = require("../services/financial/debtMonth.service");
 const {
   getIncomingBreakdownForMonth,
@@ -770,6 +769,46 @@ async function getOutgoingPaymentsGrouped(userId, start, end) {
   return Object.values(byType).sort((a, b) => b.total - a.total);
 }
 
+/**
+ * All payments in the period grouped by payment type.
+ * Types with a zero net amount are omitted.
+ */
+async function getPaymentsGroupedByType(userId, start, end) {
+  const result = await db.query(
+    `SELECT
+       pt.id AS payment_type_id,
+       pt.name AS payment_type_name,
+       COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) AS total,
+       COUNT(p.id)::int AS count
+     FROM payments p
+     JOIN payment_types pt ON pt.id = p.payment_type_id
+     LEFT JOIN (
+       SELECT payment_id, SUM(amount) AS returned_amount
+       FROM payment_returns
+       GROUP BY payment_id
+     ) ret ON ret.payment_id = p.id
+     WHERE p.user_id = $1
+       AND p.payment_date >= $2
+       AND p.payment_date <= $3
+     GROUP BY pt.id, pt.name
+     HAVING COALESCE(SUM(p.amount - COALESCE(ret.returned_amount, 0)), 0) <> 0
+     ORDER BY total DESC`,
+    [userId, start, end]
+  );
+
+  return result.rows.map((row) => {
+    const typeId = row.payment_type_id;
+    const typeName = String(row.payment_type_name || "").trim() || "Payment";
+    return {
+      payment_type_id: typeId,
+      label: typeName,
+      key: `payment_type_${typeId}`,
+      total: toAmount(row.total),
+      count: Number(row.count) || 0,
+    };
+  });
+}
+
 function buildSpendingBreakdownChart({
   expense_total,
   from_savings,
@@ -875,48 +914,8 @@ const MONTHLY_TREND_COLORS = {
   income: "#198754", // green
   spent: "#DC3545", // danger red
   from_savings: "#8FE388", // light / parrot green
-  debt: "#F97316", // orange
   balance: "#4F46E5", // indigo
 };
-
-const MONTHLY_DEBT_TREND_COLORS = {
-  i_owe_them: "#DC3545",
-  they_owe_me: "#198754",
-};
-
-function buildMonthlyDebtTrendChart(points) {
-  const months = getMonths();
-  const labels = points.map((p) => {
-    const short =
-      months.find((m) => m.id === p.month_number)?.short ||
-      String(p.month_number);
-    return `${short} ${p.year}`;
-  });
-
-  const series = [
-    {
-      name: "I Owe Them",
-      key: "i_owe_them",
-      color: MONTHLY_DEBT_TREND_COLORS.i_owe_them,
-      data: points.map((p) => p.i_owe_them),
-    },
-    {
-      name: "They Owe Me",
-      key: "they_owe_me",
-      color: MONTHLY_DEBT_TREND_COLORS.they_owe_me,
-      data: points.map((p) => p.they_owe_me),
-    },
-  ];
-
-  return {
-    type: "line",
-    title: "Monthly Debt Trend",
-    labels,
-    colors: series.map((s) => s.color),
-    series,
-    points,
-  };
-}
 
 function buildMonthlyTrendChart(points) {
   const months = getMonths();
@@ -944,12 +943,6 @@ function buildMonthlyTrendChart(points) {
       data: points.map((p) => p.from_savings),
     },
     {
-      name: "Net debt",
-      key: "debt",
-      color: MONTHLY_TREND_COLORS.debt,
-      data: points.map((p) => p.debt),
-    },
-    {
       name: "Balance",
       key: "balance",
       color: MONTHLY_TREND_COLORS.balance,
@@ -964,6 +957,31 @@ function buildMonthlyTrendChart(points) {
     colors: series.map((s) => s.color),
     series,
     points,
+  };
+}
+
+function buildPaymentsByTypeChart(groups = []) {
+  const items = (groups || [])
+    .filter((group) => (group.total || 0) !== 0)
+    .map((group, index) => ({
+      label: group.label || "Payment",
+      key: group.key || `payment_type_${group.payment_type_id}`,
+      payment_type_id: group.payment_type_id ?? null,
+      total: group.total,
+      count: group.count ?? null,
+      color:
+        SPENDING_PAYMENT_TYPE_COLORS[
+          index % SPENDING_PAYMENT_TYPE_COLORS.length
+        ],
+    }));
+
+  return {
+    type: "bar",
+    title: "Payments by Type",
+    labels: items.map((item) => item.label),
+    series: items.map((item) => item.total),
+    colors: items.map((item) => item.color),
+    items,
   };
 }
 
@@ -988,8 +1006,8 @@ function buildChartsBundle({
   balance,
   expense_total,
   payment_groups,
+  payment_type_groups,
   monthly_trend_points,
-  monthly_debt_trend_points,
 }) {
   const charts = {
     polar_area: attachPolarAreaMeta(polar_area),
@@ -1009,16 +1027,11 @@ function buildChartsBundle({
       debt,
       payment_groups,
     }),
+    payments_by_type: buildPaymentsByTypeChart(payment_type_groups),
   };
 
   if (monthly_trend_points && monthly_trend_points.length) {
     charts.monthly_trend = buildMonthlyTrendChart(monthly_trend_points);
-  }
-
-  if (monthly_debt_trend_points && monthly_debt_trend_points.length) {
-    charts.monthly_debt_trend = buildMonthlyDebtTrendChart(
-      monthly_debt_trend_points
-    );
   }
 
   return charts;
@@ -1356,27 +1369,40 @@ async function buildMonthOverviewsForCalendarYear(userId, year, options = {}) {
   return map;
 }
 
+function monthlyTrendPointFromOverview(overview, extras = {}) {
+  const earned = overview.earned || 0;
+  const not_earned = overview.not_earned || 0;
+  return {
+    month: extras.month ?? overview.month,
+    year: extras.year ?? Number(overview.year),
+    income: overview.salary,
+    earned,
+    not_earned,
+    incoming_payments: roundMoney(earned + not_earned),
+    outgoing_payments: overview.outgoing_payments_total || 0,
+    spent: roundMoney(
+      overview.expense_total + overview.outgoing_payments_total
+    ),
+    from_savings: overview.from_savings,
+    debt: overview.debt,
+    balance: overview.current_balance,
+    expense_total: overview.expense_total,
+    necessary: extras.necessary || 0,
+    unnecessary: extras.unnecessary || 0,
+  };
+}
+
 function collectTrendPointsFromOverviews(overviews, year) {
   const points = [];
   for (let m = 1; m <= 12; m++) {
     const overview = overviews.get(yearMonthKey(year, m));
     if (!overview) continue;
-    points.push({
-      month: m,
-      year: Number(year),
-      income: overview.salary,
-      earned: overview.earned || 0,
-      not_earned: overview.not_earned || 0,
-      spent: roundMoney(
-        overview.expense_total + overview.outgoing_payments_total
-      ),
-      from_savings: overview.from_savings,
-      debt: overview.debt,
-      balance: overview.current_balance,
-      expense_total: overview.expense_total,
-      necessary: 0,
-      unnecessary: 0,
-    });
+    points.push(
+      monthlyTrendPointFromOverview(overview, {
+        month: m,
+        year: Number(year),
+      })
+    );
   }
   return points;
 }
@@ -1475,11 +1501,18 @@ async function getDashboardEmiOverview(userId, start, end) {
     (sum, product) => sum + (product.payments_this_period || 0),
     0
   );
+  const remaining_emis = products.reduce((sum, product) => {
+    if (product.complete === true || product.completed === true) return sum;
+    const remaining = Number(product.remaining ?? product.emis_left);
+    if (!Number.isFinite(remaining)) return sum;
+    return sum + Math.max(0, remaining);
+  }, 0);
 
   return {
     paid_this_period,
     emi_count,
     products_count: products.length,
+    remaining_emis,
     products,
   };
 }
@@ -1493,7 +1526,7 @@ async function getDashboardEmiOverview(userId, start, end) {
  *
  * mode "month" → one month; mode "year" → full calendar year totals
  * charts: polar_area, expense_type, cashflow, spending_breakdown,
- *         monthly_trend, monthly_debt_trend
+ *         monthly_trend, payments_by_type
  */
 async function buildDashboard(userId, year, month, mode = "month") {
   if (mode === "year") {
@@ -1501,7 +1534,7 @@ async function buildDashboard(userId, year, month, mode = "month") {
   }
 
   const { start, end } = periodRange(year, month, "month");
-  const [overviews, expenseCharts, payment_groups, emi_overview, monthly_debt_trend_points] =
+  const [overviews, expenseCharts, payment_groups, payment_type_groups, emi_overview] =
     await Promise.all([
       buildMonthOverviewsForCalendarYear(userId, year, {
         factsSource: "summary",
@@ -1509,8 +1542,8 @@ async function buildDashboard(userId, year, month, mode = "month") {
       }),
       getExpenseChartsForMonth(userId, year, month),
       getOutgoingPaymentsGrouped(userId, start, end),
+      getPaymentsGroupedByType(userId, start, end),
       getDashboardEmiOverview(userId, start, end),
-      getMonthlyDebtTrendForYear(userId, year),
     ]);
   const overview = overviews.get(yearMonthKey(year, month));
   if (!overview) return null;
@@ -1552,8 +1585,8 @@ async function buildDashboard(userId, year, month, mode = "month") {
     balance,
     expense_total: overview.expense_total,
     payment_groups,
+    payment_type_groups,
     monthly_trend_points,
-    monthly_debt_trend_points,
   });
 
   return {
@@ -1655,7 +1688,7 @@ async function buildDashboardForYear(userId, year) {
   const monthly_trend_points = [];
 
   const { start, end } = periodRange(year, null, "year");
-  const [overviews, expenseCharts, payment_groups, emi_overview, monthly_debt_trend_points] =
+  const [overviews, expenseCharts, payment_groups, payment_type_groups, emi_overview] =
     await Promise.all([
       buildMonthOverviewsForCalendarYear(userId, year, {
         factsSource: "summary",
@@ -1663,8 +1696,8 @@ async function buildDashboardForYear(userId, year) {
       }),
       getExpenseChartsForYear(userId, year),
       getOutgoingPaymentsGrouped(userId, start, end),
+      getPaymentsGroupedByType(userId, start, end),
       getDashboardEmiOverview(userId, start, end),
-      getMonthlyDebtTrendForYear(userId, year),
     ]);
   const typeNetsByMonth = expenseCharts.typeNetsByMonth;
 
@@ -1678,10 +1711,6 @@ async function buildDashboardForYear(userId, year) {
       previous_balance = overview.previous_month_balance;
       previous_balance_manual = overview.previous_month_balance_manual;
     }
-
-    const monthSpent = roundMoney(
-      overview.expense_total + overview.outgoing_payments_total
-    );
 
     income = roundMoney(income + overview.salary);
     earned = roundMoney(earned + (overview.earned || 0));
@@ -1718,20 +1747,14 @@ async function buildDashboardForYear(userId, year) {
         (overview.debt_received_repaid_past_months || 0)
     );
 
-    monthly_trend_points.push({
-      month: m,
-      year: Number(year),
-      income: overview.salary,
-      earned: overview.earned || 0,
-      not_earned: overview.not_earned || 0,
-      spent: monthSpent,
-      from_savings: overview.from_savings,
-      debt: overview.debt,
-      balance: overview.current_balance,
-      expense_total: overview.expense_total,
-      necessary: typeNets.necessary,
-      unnecessary: typeNets.unnecessary,
-    });
+    monthly_trend_points.push(
+      monthlyTrendPointFromOverview(overview, {
+        month: m,
+        year: Number(year),
+        necessary: typeNets.necessary,
+        unnecessary: typeNets.unnecessary,
+      })
+    );
 
     if (m === 12) {
       balance = overview.current_balance;
@@ -1766,8 +1789,8 @@ async function buildDashboardForYear(userId, year) {
     balance,
     expense_total: expenseTotal,
     payment_groups,
+    payment_type_groups,
     monthly_trend_points,
-    monthly_debt_trend_points,
   });
 
   return {

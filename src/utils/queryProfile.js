@@ -29,6 +29,15 @@ function classifyQuery(sql) {
   if (/FROM emi_products/i.test(text)) {
     return "emi_products";
   }
+  if (
+    /GROUP BY/i.test(text) &&
+    /payment_type_id/i.test(text) &&
+    /FROM payments p/i.test(text) &&
+    !/pt\.flow = 'outgoing'/i.test(text) &&
+    !/pt\.flow = 'incoming'/i.test(text)
+  ) {
+    return "payment_type_groups";
+  }
   // Spending-breakdown grouping embeds the paid-months join subquery
   // (COUNT DISTINCT DATE_TRUNC ... FROM payments). Classify it before
   // emi_paid_months so the dashboard chart query is not miscounted.

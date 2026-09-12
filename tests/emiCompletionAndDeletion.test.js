@@ -286,7 +286,14 @@ describe("completed EMI and linked deletion guards", () => {
     expect(product.remaining).toBe(13);
     expect(product.total).toBe(1000);
     expect(product.remaining).not.toBe(product.total);
-    expect(dashboard.emi_overview.products.reduce((sum, row) => sum + row.remaining, 0)).toBeGreaterThanOrEqual(13);
+    expect(dashboard.emi_overview.remaining_emis).toBe(
+      dashboard.emi_overview.products.reduce((sum, row) => {
+        if (row.complete || row.completed) return sum;
+        return sum + (Number(row.remaining) || 0);
+      }, 0)
+    );
+    expect(dashboard.emi_overview.remaining_emis).toBeGreaterThanOrEqual(13);
+    expect(dashboard.emi_overview.remaining_emis).not.toBe(product.total);
   });
 
   test("duplicate same-month payments still count as one installment", async () => {

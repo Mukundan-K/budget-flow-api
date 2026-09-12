@@ -1,8 +1,7 @@
 const db = require("../../db");
-const { monthRangeTimestamps, APP_TIMEZONE } = require("../../utils/datetime");
+const { monthRangeTimestamps } = require("../../utils/datetime");
 const {
   calculateDebtSummary,
-  fillMonthlyDebtTrendYear,
 } = require("./debt.service");
 
 async function getDebtActivityForRange(userId, start, end, client = db) {
@@ -70,57 +69,8 @@ function toDebtOverview(summary) {
   };
 }
 
-/**
- * Calendar-year month-end debt balances from debts.debt_date.
- * Same formulas as outstanding / person balance; idle months carry forward.
- */
-async function getMonthlyDebtTrendForYear(userId, year, client = db) {
-  const start = monthRangeTimestamps(year, 1).start;
-  const end = monthRangeTimestamps(year, 12).end;
-  const [openingResult, yearResult] = await Promise.all([
-    client.query(
-      `SELECT
-         COALESCE(SUM(CASE WHEN debt_type = 'received' THEN amount ELSE 0 END), 0) AS received_total,
-         COALESCE(SUM(CASE WHEN debt_type = 'returned_by_me' THEN amount ELSE 0 END), 0) AS returned_by_me,
-         COALESCE(SUM(CASE WHEN debt_type = 'given' THEN amount ELSE 0 END), 0) AS given_total,
-         COALESCE(SUM(CASE WHEN debt_type = 'returned_to_me' THEN amount ELSE 0 END), 0) AS returned_to_me
-       FROM debts
-       WHERE user_id = $1
-         AND debt_date < $2`,
-      [userId, start]
-    ),
-    client.query(
-      `SELECT
-         EXTRACT(MONTH FROM (debt_date AT TIME ZONE $4))::int AS month,
-         COALESCE(SUM(CASE WHEN debt_type = 'received' THEN amount ELSE 0 END), 0) AS received_total,
-         COALESCE(SUM(CASE WHEN debt_type = 'returned_by_me' THEN amount ELSE 0 END), 0) AS returned_by_me,
-         COALESCE(SUM(CASE WHEN debt_type = 'given' THEN amount ELSE 0 END), 0) AS given_total,
-         COALESCE(SUM(CASE WHEN debt_type = 'returned_to_me' THEN amount ELSE 0 END), 0) AS returned_to_me
-       FROM debts
-       WHERE user_id = $1
-         AND debt_date >= $2
-         AND debt_date <= $3
-       GROUP BY 1`,
-      [userId, start, end, APP_TIMEZONE]
-    ),
-  ]);
-
-  const byMonth = new Map();
-  yearResult.rows.forEach((row) => {
-    byMonth.set(Number(row.month), {
-      received_total: row.received_total,
-      returned_by_me: row.returned_by_me,
-      given_total: row.given_total,
-      returned_to_me: row.returned_to_me,
-    });
-  });
-
-  return fillMonthlyDebtTrendYear(year, byMonth, openingResult.rows[0] || {});
-}
-
 module.exports = {
   getDebtActivityForRange,
   getDebtMonthNetForMonth,
-  getMonthlyDebtTrendForYear,
   toDebtOverview,
 };
