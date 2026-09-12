@@ -20,6 +20,7 @@ describe("dashboard production read path uses summary facts", () => {
     expect(fn).not.toMatch(/buildMonthOverviewFromSource/);
     expect(fn).toMatch(/collectTrendPointsFromOverviews/);
     expect(fn).toMatch(/getExpenseChartsForMonth/);
+    expect(fn).toMatch(/getMonthlyDebtTrendForYear/);
     expect(fn).not.toMatch(/getExpenseTypeNetsForMonth/);
     expect(fn).not.toMatch(/getCategoryPolarArea/);
   });
@@ -30,6 +31,7 @@ describe("dashboard production read path uses summary facts", () => {
     expect(fn).not.toMatch(/factsSource: "source"/);
     expect(fn).not.toMatch(/buildMonthOverviewFromSource/);
     expect(fn).toMatch(/getExpenseChartsForYear/);
+    expect(fn).toMatch(/getMonthlyDebtTrendForYear/);
     expect(fn).not.toMatch(/getExpenseTypeNetsForMonth/);
     expect(fn).not.toMatch(/getExpenseTypeNetsForYear/);
     expect(fn).not.toMatch(/getCategoryPolarArea/);

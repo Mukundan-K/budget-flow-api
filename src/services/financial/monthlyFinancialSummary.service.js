@@ -364,8 +364,7 @@ function maxYearMonth(a, b) {
 }
 
 /**
- * Inclusive range: earliest activity (same sources as findEarliestYearMonth,
- * plus debt_returns for latest) through the later of last activity and
+ * Inclusive range: earliest activity through the later of last activity and
  * the current calendar month in APP_TIMEZONE.
  */
 async function resolveBackfillRange(userId, client = db) {

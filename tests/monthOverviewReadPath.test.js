@@ -348,5 +348,10 @@ describe("month overview summary read path", () => {
     expect(dashboard.previous_balance).toBe(january.previous_balance);
     expect(dashboard.filter.mode).toBe("year");
     expect(dashboard.charts.monthly_trend.points).toHaveLength(12);
+    expect(dashboard.charts.monthly_debt_trend.points).toHaveLength(12);
+    expect(dashboard.charts.monthly_debt_trend.series.map((s) => s.name)).toEqual([
+      "I Owe Them",
+      "They Owe Me",
+    ]);
   });
 });

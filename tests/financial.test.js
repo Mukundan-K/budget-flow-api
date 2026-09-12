@@ -9,6 +9,7 @@ const {
   calculateDebtAmounts,
   calculateDebtNet,
   calculateDebtSummary,
+  calculatePersonBalances,
   calculatePreviousBalance,
   calculateMonthlyBalance,
   calculateFinancialSummary,
@@ -116,6 +117,28 @@ describe("debt calculations", () => {
     expect(withRepay.received_repaid_this_month).toBe(400);
     expect(withRepay.received_repaid_past_months).toBe(600);
 
+    const john = calculatePersonBalances({
+      received_total: 10000,
+      returned_by_me: 3000,
+      given_total: 4000,
+      returned_to_me: 1000,
+    });
+    expect(john.i_owe_them).toBe(7000);
+    expect(john.they_owe_me).toBe(3000);
+    expect(john.net_amount).toBe(4000);
+
+    const overReturned = calculatePersonBalances({
+      received_total: 5000,
+      returned_by_me: 5100,
+      given_total: 600,
+      returned_to_me: 700,
+    });
+    expect(overReturned.i_owe_them).toBe(-100);
+    expect(overReturned.they_owe_me).toBe(-100);
+    expect(overReturned.net_amount).toBe(0);
+
+    // Generic amount − returned helper still exists for payments/expenses.
+    // Live debt repayments are separate debts rows, not per-row returned_amount.
     const open = calculateDebtAmounts({ amount: 1000, returned_amount: 200 });
     expect(open.is_pending_zero).toBe(false);
     expect(open.has_pending).toBe(true);

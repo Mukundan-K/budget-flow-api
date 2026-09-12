@@ -81,6 +81,40 @@ async function monthlyNets(uid, year) {
   return months;
 }
 
+function profileCount(profile, name) {
+  return profile.byName.find((row) => row.name === name)?.count || 0;
+}
+
+/**
+ * Current dashboard SQL contract (month or year mode):
+ * - one combined expense-charts query (not polar + type-net helpers)
+ * - summary facts, not per-month source facts
+ * - two Monthly Debt Trend queries (opening + year buckets)
+ * - selected-month live overlay: salary date, EMI stats, debt repaid split
+ * - EMI overview: products + period payments + paid-months before/through
+ * Total 14 queries for a year that already has activity.
+ */
+function expectDashboardQueryContract(profile) {
+  expect(profileCount(profile, "expense_charts")).toBe(1);
+  expect(profileCount(profile, "category_polar")).toBe(0);
+  expect(profileCount(profile, "expense_type_nets")).toBe(0);
+  expect(profileCount(profile, "expense_type_nets_year")).toBe(0);
+  expect(profile.sourceFactQueries).toBe(0);
+  expect(profileCount(profile, "monthly_financial_summary")).toBe(1);
+  expect(profileCount(profile, "monthly_balances")).toBe(1);
+  expect(profileCount(profile, "activity_range")).toBe(1);
+  expect(profileCount(profile, "outgoing_payment_groups")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend")).toBe(1);
+  expect(profileCount(profile, "latest_salary")).toBe(1);
+  expect(profileCount(profile, "emi_stats")).toBe(1);
+  expect(profileCount(profile, "debt_originated")).toBe(1);
+  expect(profileCount(profile, "emi_products")).toBe(1);
+  expect(profileCount(profile, "emi_period_payments")).toBe(1);
+  expect(profileCount(profile, "emi_paid_months")).toBe(2);
+  expect(profile.queryCount).toBe(14);
+}
+
 describe("getExpenseTypeNetsForYear matches 12 monthly queries", () => {
   beforeAll(async () => {
     await seedSchema();
@@ -243,7 +277,7 @@ describe("getExpenseTypeNetsForYear matches 12 monthly queries", () => {
     });
   });
 
-  test("year dashboard issues one expense-type SQL query, not 12", async () => {
+  test("year dashboard issues one combined expense-chart query and the current dashboard read set", async () => {
     const stop = installQueryProfile(db);
     try {
       resetQueryProfile();
@@ -263,13 +297,13 @@ describe("getExpenseTypeNetsForYear matches 12 monthly queries", () => {
       expect(combined).toEqual(
         expect.objectContaining({ name: "expense_charts", count: 1 })
       );
-      expect(profile.queryCount).toBe(9);
+      expectDashboardQueryContract(profile);
     } finally {
       stop();
     }
   });
 
-  test("month dashboard uses one combined expense-chart query", async () => {
+  test("month dashboard uses one combined expense-chart query and the current dashboard read set", async () => {
     const stop = installQueryProfile(db);
     try {
       resetQueryProfile();
@@ -287,7 +321,7 @@ describe("getExpenseTypeNetsForYear matches 12 monthly queries", () => {
       expect(monthlyType).toBeUndefined();
       expect(polar).toBeUndefined();
       expect(combined.count).toBe(1);
-      expect(profile.queryCount).toBe(9);
+      expectDashboardQueryContract(profile);
     } finally {
       stop();
     }

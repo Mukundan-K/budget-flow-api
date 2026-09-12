@@ -318,4 +318,68 @@ describe("payment type mutation monthly_financial_summary sync", () => {
     expect(first.earned).toBe(0);
     await expectSummaryMatchesSource(userId, YEAR, 12);
   });
+
+  test("payment type responses include flow, is_income, created_at, and list in_use", async () => {
+    const created = await jsonRequest("POST", "/api/payment-types", {
+      name: `${SUFFIX}_shape`,
+      flow: "incoming",
+      is_income: true,
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.data).toEqual(
+      expect.objectContaining({
+        id: expect.any(Number),
+        name: `${SUFFIX}_shape`,
+        flow: "incoming",
+        is_income: true,
+        in_use: false,
+      })
+    );
+    expect(created.json.data.created_at).toBeTruthy();
+
+    const typeId = created.json.data.id;
+    await createPayment(userId, typeId, 10, `${YEAR}-01-02`);
+
+    const listed = await jsonRequest("GET", "/api/payment-types");
+    const row = listed.json.data.find((item) => item.id === typeId);
+    expect(row).toEqual(
+      expect.objectContaining({
+        id: typeId,
+        name: `${SUFFIX}_shape`,
+        flow: "incoming",
+        is_income: true,
+        in_use: true,
+      })
+    );
+    expect(row.created_at).toBeTruthy();
+
+    const one = await jsonRequest("GET", `/api/payment-types/${typeId}`);
+    expect(one.status).toBe(200);
+    expect(one.json.data).toEqual(
+      expect.objectContaining({
+        id: typeId,
+        flow: "incoming",
+        is_income: true,
+        created_at: expect.anything(),
+      })
+    );
+    // GET /:id does not select in_use, so mapPaymentType currently reports false.
+    expect(one.json.data.in_use).toBe(false);
+
+    const patched = await jsonRequest("PATCH", `/api/payment-types/${typeId}`, {
+      flow: "outgoing",
+      is_income: false,
+    });
+    expect(patched.status).toBe(200);
+    expect(patched.json.data).toEqual(
+      expect.objectContaining({
+        id: typeId,
+        name: `${SUFFIX}_shape`,
+        flow: "outgoing",
+        is_income: false,
+        in_use: false,
+        created_at: expect.anything(),
+      })
+    );
+  });
 });

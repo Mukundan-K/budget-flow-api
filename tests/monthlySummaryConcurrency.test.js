@@ -201,7 +201,13 @@ describe("monthly summary concurrent rebuild locking", () => {
 
       await b.query("BEGIN");
       await insertExpense(b, userId, 20, `${YEAR}-07-01`);
+      const julyKeys = monthlySummaryLockKeys(userId, YEAR, 7);
       await b.query("SET LOCAL lock_timeout = '200ms'");
+      await b.query(
+        "SELECT pg_advisory_xact_lock($1::integer, $2::integer)",
+        [julyKeys.userKey, julyKeys.monthKey]
+      );
+      await b.query("SET LOCAL lock_timeout = '0'");
       await rebuildMonthlyFinancialSummary(userId, YEAR, 7, b);
       await b.query("COMMIT");
       await a.query("COMMIT");
@@ -236,7 +242,13 @@ describe("monthly summary concurrent rebuild locking", () => {
 
       await b.query("BEGIN");
       await insertExpense(b, otherUserId, 22, `${YEAR}-08-01`);
+      const otherKeys = monthlySummaryLockKeys(otherUserId, YEAR, 8);
       await b.query("SET LOCAL lock_timeout = '200ms'");
+      await b.query(
+        "SELECT pg_advisory_xact_lock($1::integer, $2::integer)",
+        [otherKeys.userKey, otherKeys.monthKey]
+      );
+      await b.query("SET LOCAL lock_timeout = '0'");
       await rebuildMonthlyFinancialSummary(otherUserId, YEAR, 8, b);
       await b.query("COMMIT");
       await a.query("COMMIT");

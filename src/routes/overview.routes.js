@@ -30,6 +30,7 @@ const {
 } = require("../services/financial");
 const {
   getDebtMonthNetForMonth,
+  getMonthlyDebtTrendForYear,
 } = require("../services/financial/debtMonth.service");
 const {
   getIncomingBreakdownForMonth,
@@ -878,6 +879,45 @@ const MONTHLY_TREND_COLORS = {
   balance: "#4F46E5", // indigo
 };
 
+const MONTHLY_DEBT_TREND_COLORS = {
+  i_owe_them: "#DC3545",
+  they_owe_me: "#198754",
+};
+
+function buildMonthlyDebtTrendChart(points) {
+  const months = getMonths();
+  const labels = points.map((p) => {
+    const short =
+      months.find((m) => m.id === p.month_number)?.short ||
+      String(p.month_number);
+    return `${short} ${p.year}`;
+  });
+
+  const series = [
+    {
+      name: "I Owe Them",
+      key: "i_owe_them",
+      color: MONTHLY_DEBT_TREND_COLORS.i_owe_them,
+      data: points.map((p) => p.i_owe_them),
+    },
+    {
+      name: "They Owe Me",
+      key: "they_owe_me",
+      color: MONTHLY_DEBT_TREND_COLORS.they_owe_me,
+      data: points.map((p) => p.they_owe_me),
+    },
+  ];
+
+  return {
+    type: "line",
+    title: "Monthly Debt Trend",
+    labels,
+    colors: series.map((s) => s.color),
+    series,
+    points,
+  };
+}
+
 function buildMonthlyTrendChart(points) {
   const months = getMonths();
   const labels = points.map(
@@ -949,6 +989,7 @@ function buildChartsBundle({
   expense_total,
   payment_groups,
   monthly_trend_points,
+  monthly_debt_trend_points,
 }) {
   const charts = {
     polar_area: attachPolarAreaMeta(polar_area),
@@ -972,6 +1013,12 @@ function buildChartsBundle({
 
   if (monthly_trend_points && monthly_trend_points.length) {
     charts.monthly_trend = buildMonthlyTrendChart(monthly_trend_points);
+  }
+
+  if (monthly_debt_trend_points && monthly_debt_trend_points.length) {
+    charts.monthly_debt_trend = buildMonthlyDebtTrendChart(
+      monthly_debt_trend_points
+    );
   }
 
   return charts;
@@ -1445,7 +1492,8 @@ async function getDashboardEmiOverview(userId, start, end) {
  * Remaining  = Spendable − Total Spent − Savings − Debt
  *
  * mode "month" → one month; mode "year" → full calendar year totals
- * charts: polar_area, expense_type, cashflow, spending_breakdown, monthly_trend
+ * charts: polar_area, expense_type, cashflow, spending_breakdown,
+ *         monthly_trend, monthly_debt_trend
  */
 async function buildDashboard(userId, year, month, mode = "month") {
   if (mode === "year") {
@@ -1453,7 +1501,7 @@ async function buildDashboard(userId, year, month, mode = "month") {
   }
 
   const { start, end } = periodRange(year, month, "month");
-  const [overviews, expenseCharts, payment_groups, emi_overview] =
+  const [overviews, expenseCharts, payment_groups, emi_overview, monthly_debt_trend_points] =
     await Promise.all([
       buildMonthOverviewsForCalendarYear(userId, year, {
         factsSource: "summary",
@@ -1462,6 +1510,7 @@ async function buildDashboard(userId, year, month, mode = "month") {
       getExpenseChartsForMonth(userId, year, month),
       getOutgoingPaymentsGrouped(userId, start, end),
       getDashboardEmiOverview(userId, start, end),
+      getMonthlyDebtTrendForYear(userId, year),
     ]);
   const overview = overviews.get(yearMonthKey(year, month));
   if (!overview) return null;
@@ -1504,6 +1553,7 @@ async function buildDashboard(userId, year, month, mode = "month") {
     expense_total: overview.expense_total,
     payment_groups,
     monthly_trend_points,
+    monthly_debt_trend_points,
   });
 
   return {
@@ -1605,7 +1655,7 @@ async function buildDashboardForYear(userId, year) {
   const monthly_trend_points = [];
 
   const { start, end } = periodRange(year, null, "year");
-  const [overviews, expenseCharts, payment_groups, emi_overview] =
+  const [overviews, expenseCharts, payment_groups, emi_overview, monthly_debt_trend_points] =
     await Promise.all([
       buildMonthOverviewsForCalendarYear(userId, year, {
         factsSource: "summary",
@@ -1614,6 +1664,7 @@ async function buildDashboardForYear(userId, year) {
       getExpenseChartsForYear(userId, year),
       getOutgoingPaymentsGrouped(userId, start, end),
       getDashboardEmiOverview(userId, start, end),
+      getMonthlyDebtTrendForYear(userId, year),
     ]);
   const typeNetsByMonth = expenseCharts.typeNetsByMonth;
 
@@ -1716,6 +1767,7 @@ async function buildDashboardForYear(userId, year) {
     expense_total: expenseTotal,
     payment_groups,
     monthly_trend_points,
+    monthly_debt_trend_points,
   });
 
   return {

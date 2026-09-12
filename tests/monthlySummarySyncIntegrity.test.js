@@ -97,13 +97,13 @@ describe("monthly summary sync integrity", () => {
     ).toHaveLength(4);
   });
 
-  test("debt mutations rebuild origin and return months inside BEGIN", () => {
+  test("debt mutations rebuild origin months inside BEGIN", () => {
     const src = readSrc("src/routes/debt.routes.js");
     expect(src).toMatch(/yearMonthFromTimestamp/);
     expect(src).toMatch(/debtOriginSummaryTarget/);
-    expect(src).toMatch(/debtReturnSummaryTarget/);
-    expect(src.match(/client\.query\("BEGIN"\)/g) || []).toHaveLength(5);
-    expect(src).not.toMatch(/UPDATE debt_returns/);
+    expect(src).not.toMatch(/debtReturnSummaryTarget/);
+    expect(src).not.toMatch(/debt_returns/);
+    expect(src.match(/client\.query\("BEGIN"\)/g) || []).toHaveLength(4);
   });
 
   test("payment-type classification changes rebuild; balances do not", () => {

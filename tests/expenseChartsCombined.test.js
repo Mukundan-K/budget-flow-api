@@ -98,6 +98,31 @@ async function oldYearPair(uid, year) {
   };
 }
 
+function profileCount(profile, name) {
+  return profile.byName.find((row) => row.name === name)?.count || 0;
+}
+
+function expectDashboardQueryContract(profile) {
+  expect(profileCount(profile, "expense_charts")).toBe(1);
+  expect(profileCount(profile, "category_polar")).toBe(0);
+  expect(profileCount(profile, "expense_type_nets")).toBe(0);
+  expect(profileCount(profile, "expense_type_nets_year")).toBe(0);
+  expect(profile.sourceFactQueries).toBe(0);
+  expect(profileCount(profile, "monthly_financial_summary")).toBe(1);
+  expect(profileCount(profile, "monthly_balances")).toBe(1);
+  expect(profileCount(profile, "activity_range")).toBe(1);
+  expect(profileCount(profile, "outgoing_payment_groups")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend_opening")).toBe(1);
+  expect(profileCount(profile, "monthly_debt_trend")).toBe(1);
+  expect(profileCount(profile, "latest_salary")).toBe(1);
+  expect(profileCount(profile, "emi_stats")).toBe(1);
+  expect(profileCount(profile, "debt_originated")).toBe(1);
+  expect(profileCount(profile, "emi_products")).toBe(1);
+  expect(profileCount(profile, "emi_period_payments")).toBe(1);
+  expect(profileCount(profile, "emi_paid_months")).toBe(2);
+  expect(profile.queryCount).toBe(14);
+}
+
 describe("combined expense charts match polar + type-net helpers", () => {
   beforeAll(async () => {
     await seedSchema();
@@ -329,8 +354,15 @@ describe("combined expense charts match polar + type-net helpers", () => {
     expect(dashboard.from_savings).toEqual(expect.any(Number));
     expect(dashboard.debt).toEqual(expect.any(Number));
     expect(dashboard.charts.monthly_trend.points).toHaveLength(12);
+    expect(dashboard.charts.monthly_debt_trend.points).toHaveLength(12);
+    expect(dashboard.charts.monthly_debt_trend.series.map((s) => s.name)).toEqual([
+      "I Owe Them",
+      "They Owe Me",
+    ]);
     expect(dashboard.charts.spending_breakdown).toBeTruthy();
     expect(dashboard.charts.expense_type).toBeTruthy();
+    expect(dashboard.emi_overview.products).toEqual([]);
+    expect(dashboard.emi_overview.paid_this_period).toBe(0);
   });
 
   test("year dashboard polar and type nets match old helpers", async () => {
@@ -354,28 +386,20 @@ describe("combined expense charts match polar + type-net helpers", () => {
       expect(point.necessary).toBe(monthNets.necessary);
       expect(point.unnecessary).toBe(monthNets.unnecessary);
     });
+    expect(dashboard.charts.monthly_debt_trend.series).toHaveLength(2);
+    expect(dashboard.charts.monthly_debt_trend.points).toHaveLength(12);
   });
 
-  test("month and year dashboards issue one combined expense-chart query", async () => {
+  test("month and year dashboards issue one combined expense-chart query and the current dashboard read set", async () => {
     const stop = installQueryProfile(db);
     try {
       resetQueryProfile();
       await buildDashboard(userId, YEAR, 5, "month");
-      const monthProfile = getQueryProfile();
-      expect(monthProfile.byName.find((row) => row.name === "expense_charts").count).toBe(1);
-      expect(monthProfile.byName.find((row) => row.name === "category_polar")).toBeUndefined();
-      expect(monthProfile.byName.find((row) => row.name === "expense_type_nets")).toBeUndefined();
-      expect(monthProfile.queryCount).toBe(9);
+      expectDashboardQueryContract(getQueryProfile());
 
       resetQueryProfile();
       await buildDashboard(userId, YEAR, null, "year");
-      const yearProfile = getQueryProfile();
-      expect(yearProfile.byName.find((row) => row.name === "expense_charts").count).toBe(1);
-      expect(yearProfile.byName.find((row) => row.name === "category_polar")).toBeUndefined();
-      expect(
-        yearProfile.byName.find((row) => row.name === "expense_type_nets_year")
-      ).toBeUndefined();
-      expect(yearProfile.queryCount).toBe(9);
+      expectDashboardQueryContract(getQueryProfile());
     } finally {
       stop();
     }

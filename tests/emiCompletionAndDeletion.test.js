@@ -134,7 +134,6 @@ describe("completed EMI and linked deletion guards", () => {
       await safeDelete(`DELETE FROM payment_returns WHERE user_id = $1`, [userId]);
       await safeDelete(`DELETE FROM payments WHERE user_id = $1`, [userId]);
       await safeDelete(`DELETE FROM savings_transactions WHERE user_id = $1`, [userId]);
-      await safeDelete(`DELETE FROM debt_returns WHERE user_id = $1`, [userId]);
       await safeDelete(`DELETE FROM debts WHERE user_id = $1`, [userId]);
       await safeDelete(`DELETE FROM emi_products WHERE user_id = $1`, [userId]);
       await safeDelete(`DELETE FROM persons WHERE user_id = $1`, [userId]);
@@ -266,6 +265,28 @@ describe("completed EMI and linked deletion guards", () => {
       emi: { emi_product_id: emiId },
     });
     expect(payment.status).toBe(201);
+  });
+
+  test("dashboard Remaining EMIs is pending installment count, not money", async () => {
+    const emiId = await insertEmi({
+      name: `${SUFFIX}_dash_remaining`,
+      alreadyPaid: 10,
+      numberOfEmis: 24,
+      startDate: "2025-01-15",
+    });
+    await insertEmiPayment(emiId, "2026-03-10");
+
+    const { buildDashboard } = require("../src/routes/overview.routes");
+    const dashboard = await buildDashboard(userId, 2026, 3, "month");
+    const product = dashboard.emi_overview.products.find(
+      (row) => Number(row.emi_product_id) === Number(emiId)
+    );
+
+    expect(product).toBeTruthy();
+    expect(product.remaining).toBe(13);
+    expect(product.total).toBe(1000);
+    expect(product.remaining).not.toBe(product.total);
+    expect(dashboard.emi_overview.products.reduce((sum, row) => sum + row.remaining, 0)).toBeGreaterThanOrEqual(13);
   });
 
   test("duplicate same-month payments still count as one installment", async () => {

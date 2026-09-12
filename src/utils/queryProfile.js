@@ -26,18 +26,46 @@ function classifyQuery(sql) {
   if (/LOWER\(\s*pt\.name\s*\)\s*=\s*'salary'/i.test(text)) {
     return "latest_salary";
   }
-  if (/\bAS section\b/i.test(text) && /'polar'/i.test(text)) {
-    return "expense_charts";
+  if (/FROM emi_products/i.test(text)) {
+    return "emi_products";
   }
-  if (/GROUP BY t\.category/i.test(text)) {
-    return "category_polar";
-  }
+  // Spending-breakdown grouping embeds the paid-months join subquery
+  // (COUNT DISTINCT DATE_TRUNC ... FROM payments). Classify it before
+  // emi_paid_months so the dashboard chart query is not miscounted.
   if (
     /pt\.flow = 'outgoing'/i.test(text) &&
     /GROUP BY/i.test(text) &&
     /payment_type/i.test(text)
   ) {
     return "outgoing_payment_groups";
+  }
+  if (
+    /COUNT\(DISTINCT DATE_TRUNC\('month'/i.test(text) &&
+    /FROM payments/i.test(text)
+  ) {
+    return "emi_paid_months";
+  }
+  if (
+    /emi_product_id IS NOT NULL/i.test(text) &&
+    /AS paid_amount/i.test(text)
+  ) {
+    return "emi_period_payments";
+  }
+  if (
+    /FROM debts/i.test(text) &&
+    /EXTRACT\(MONTH FROM \(debt_date/i.test(text)
+  ) {
+    return "monthly_debt_trend";
+  }
+  // Strict `< $n` — do not match `debt_date <=` from month-range activity.
+  if (/FROM debts/i.test(text) && /debt_date < \$/i.test(text)) {
+    return "monthly_debt_trend_opening";
+  }
+  if (/\bAS section\b/i.test(text) && /'polar'/i.test(text)) {
+    return "expense_charts";
+  }
+  if (/GROUP BY t\.category/i.test(text)) {
+    return "category_polar";
   }
   if (/AS necessary/i.test(text) && /AS unnecessary/i.test(text)) {
     if (/GROUP BY t\.month/i.test(text)) return "expense_type_nets_year";
@@ -60,9 +88,6 @@ function classifyQuery(sql) {
   }
   if (/FROM debts/i.test(text) && /given_total/i.test(text)) {
     return "debt_originated";
-  }
-  if (/FROM debt_returns r/i.test(text)) {
-    return "debt_returns";
   }
   return "other";
 }

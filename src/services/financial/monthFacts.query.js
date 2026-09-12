@@ -159,8 +159,6 @@ async function findLatestYearMonth(userId, client = db) {
       UNION ALL
       SELECT MAX(debt_date) AS d FROM debts WHERE user_id = $1
       UNION ALL
-      SELECT MAX(return_date) AS d FROM debt_returns WHERE user_id = $1
-      UNION ALL
       SELECT MAKE_DATE(year, month, 1) AS d FROM monthly_balances WHERE user_id = $1
     ) t
     `,

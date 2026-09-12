@@ -27,10 +27,105 @@ function calculateDebtAmounts({ amount, returned_amount = 0 } = {}) {
 
 /**
  * debt_net = given_outstanding − received_outstanding
- * (or given_net − received_net for month activity)
+ * (or given_net − received_net for month activity / remaining-balance cash flow)
  */
 function calculateDebtNet(givenOutstanding = 0, receivedOutstanding = 0) {
   return roundMoney(toAmount(givenOutstanding) - toAmount(receivedOutstanding));
+}
+
+/**
+ * Current outstanding balances (all history, never month-filtered).
+ *
+ * I Owe Them  = Received − Returned by me
+ * They Owe Me = Given − Returned to me
+ * Net Amount  = I Owe Them − They Owe Me
+ *   positive → I owe overall; negative → they owe me; zero → settled
+ */
+function calculatePersonBalances({
+  received_total = 0,
+  returned_by_me = 0,
+  given_total = 0,
+  returned_to_me = 0,
+} = {}) {
+  const received = toAmount(received_total);
+  const given = toAmount(given_total);
+  const returnedByMe = toAmount(returned_by_me);
+  const returnedToMe = toAmount(returned_to_me);
+  const i_owe_them = roundMoney(received - returnedByMe);
+  const they_owe_me = roundMoney(given - returnedToMe);
+  const net_amount = roundMoney(i_owe_them - they_owe_me);
+  return {
+    received_total: received,
+    given_total: given,
+    returned_by_me: returnedByMe,
+    returned_to_me: returnedToMe,
+    i_owe_them,
+    they_owe_me,
+    net_amount,
+  };
+}
+
+function formatDebtYearMonth(year, month) {
+  return `${Number(year)}-${String(Number(month)).padStart(2, "0")}`;
+}
+
+/**
+ * Month-end outstanding using the same rules as Debt Overview:
+ * I Owe Them / They Owe Me / Net Debt. Negatives are preserved.
+ */
+function monthlyDebtTrendPoint(year, month, totals = {}) {
+  const balances = calculatePersonBalances(totals);
+  return {
+    month: formatDebtYearMonth(year, month),
+    year: Number(year),
+    month_number: Number(month),
+    i_owe_them: balances.i_owe_them,
+    they_owe_me: balances.they_owe_me,
+    net_debt: balances.net_amount,
+    iOweThem: balances.i_owe_them,
+    theyOweMe: balances.they_owe_me,
+    netDebt: balances.net_amount,
+  };
+}
+
+function emptyDebtTotals() {
+  return {
+    received_total: 0,
+    returned_by_me: 0,
+    given_total: 0,
+    returned_to_me: 0,
+  };
+}
+
+function addDebtTotals(base = {}, extra = {}) {
+  return {
+    received_total: roundMoney(
+      toAmount(base.received_total) + toAmount(extra.received_total)
+    ),
+    returned_by_me: roundMoney(
+      toAmount(base.returned_by_me) + toAmount(extra.returned_by_me)
+    ),
+    given_total: roundMoney(
+      toAmount(base.given_total) + toAmount(extra.given_total)
+    ),
+    returned_to_me: roundMoney(
+      toAmount(base.returned_to_me) + toAmount(extra.returned_to_me)
+    ),
+  };
+}
+
+/**
+ * 12 month-end balances for a year. Each month carries forward prior
+ * outstanding, matching Debt Overview at year-end when all history is included.
+ */
+function fillMonthlyDebtTrendYear(year, byMonth = new Map(), opening = {}) {
+  let running = addDebtTotals(emptyDebtTotals(), opening);
+  const points = [];
+  for (let month = 1; month <= 12; month++) {
+    running = addDebtTotals(running, byMonth.get(month) || emptyDebtTotals());
+    points.push(monthlyDebtTrendPoint(year, month, running));
+  }
+  return points;
 }
 
 function calculateDebtSummary({
@@ -79,4 +174,7 @@ module.exports = {
   calculateDebtAmounts,
   calculateDebtNet,
   calculateDebtSummary,
+  calculatePersonBalances,
+  monthlyDebtTrendPoint,
+  fillMonthlyDebtTrendYear,
 };

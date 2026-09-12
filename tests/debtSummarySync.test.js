@@ -227,7 +227,7 @@ describe("debt mutation monthly_financial_summary sync", () => {
     expect(newUser.given_total).toBe(1750);
   });
 
-  test("given → received moves origin and return facts", async () => {
+  test("given → received does not move independent return transactions", async () => {
     const created = await jsonRequest("POST", "/api/debts", {
       amount: 10000,
       date: `${YEAR}-08-02`,
@@ -236,10 +236,12 @@ describe("debt mutation monthly_financial_summary sync", () => {
       debt_type: "given",
     });
     const debtId = created.json.data.id;
-    await jsonRequest("POST", `/api/debts/${debtId}/returns`, {
+    await jsonRequest("POST", "/api/debts/transactions", {
       amount: 4000,
       date: `${YEAR}-09-05`,
       user_id: userId,
+      person_id: personId,
+      transaction_type: "returned_to_me",
     });
 
     const updated = await jsonRequest("PATCH", `/api/debts/${debtId}`, {
@@ -251,25 +253,26 @@ describe("debt mutation monthly_financial_summary sync", () => {
     const september = await expectSummaryMatchesSource(userId, YEAR, 9);
     expect(august.given_total).toBe(0);
     expect(august.received_total).toBe(10000);
-    expect(september.given_returned).toBe(0);
-    expect(september.received_returned).toBe(4000);
+    expect(september.given_returned).toBe(4000);
+    expect(september.received_returned).toBe(0);
   });
 
-  test("debt return uses return_date month, not parent debt_date month", async () => {
-    const created = await jsonRequest("POST", "/api/debts", {
+  test("returned_to_me uses its own debt_date month, not the origin month", async () => {
+    await jsonRequest("POST", "/api/debts", {
       amount: 10000,
       date: `${YEAR}-10-10`,
       user_id: userId,
       person_id: personId,
       debt_type: "given",
     });
-    const debtId = created.json.data.id;
     await rebuildMonthlyFinancialSummary(userId, YEAR, 11);
 
-    const returned = await jsonRequest("POST", `/api/debts/${debtId}/returns`, {
+    const returned = await jsonRequest("POST", "/api/debts/transactions", {
       amount: 3000,
       date: `${YEAR}-11-05`,
       user_id: userId,
+      person_id: personId,
+      transaction_type: "returned_to_me",
     });
     expect(returned.status).toBe(201);
 
@@ -282,7 +285,7 @@ describe("debt mutation monthly_financial_summary sync", () => {
 
     const deletedReturn = await jsonRequest(
       "DELETE",
-      `/api/debts/${debtId}/returns/${returned.json.data.return.id}`
+      `/api/debts/${returned.json.data.debt.id}`
     );
     expect(deletedReturn.status).toBe(200);
 
@@ -292,18 +295,20 @@ describe("debt mutation monthly_financial_summary sync", () => {
     expect(octoberAfter.given_total).toBe(10000);
   });
 
-  test("received debt return updates received_returned on return_date month", async () => {
-    const created = await jsonRequest("POST", "/api/debts", {
+  test("returned_by_me updates received_returned on its own debt_date month", async () => {
+    await jsonRequest("POST", "/api/debts", {
       amount: 5000,
       date: `${YEAR}-01-20`,
       user_id: userId,
       person_id: personId,
       debt_type: "received",
     });
-    await jsonRequest("POST", `/api/debts/${created.json.data.id}/returns`, {
+    await jsonRequest("POST", "/api/debts/transactions", {
       amount: 1200,
       date: `${YEAR}-02-18`,
       user_id: userId,
+      person_id: personId,
+      transaction_type: "returned_by_me",
     });
 
     const january = await expectSummaryMatchesSource(userId, YEAR, 1);
@@ -313,7 +318,7 @@ describe("debt mutation monthly_financial_summary sync", () => {
     expect(february.received_returned).toBe(1200);
   });
 
-  test("deleting a debt cascades returns and rebuilds origin plus return months", async () => {
+  test("deleting an origin debt does not delete independent return transactions", async () => {
     const created = await jsonRequest("POST", "/api/debts", {
       amount: 10000,
       date: `${YEAR}-12-02`,
@@ -323,15 +328,19 @@ describe("debt mutation monthly_financial_summary sync", () => {
     });
     const debtId = created.json.data.id;
 
-    await jsonRequest("POST", `/api/debts/${debtId}/returns`, {
+    await jsonRequest("POST", "/api/debts/transactions", {
       amount: 4000,
       date: `${YEAR + 1}-01-10`,
       user_id: userId,
+      person_id: personId,
+      transaction_type: "returned_to_me",
     });
-    await jsonRequest("POST", `/api/debts/${debtId}/returns`, {
+    await jsonRequest("POST", "/api/debts/transactions", {
       amount: 2000,
       date: `${YEAR + 1}-02-10`,
       user_id: userId,
+      person_id: personId,
+      transaction_type: "returned_to_me",
     });
 
     expect((await expectSummaryMatchesSource(userId, YEAR, 12)).given_total).toBe(
@@ -348,20 +357,22 @@ describe("debt mutation monthly_financial_summary sync", () => {
     expect(deleted.status).toBe(200);
 
     const remainingReturns = await db.query(
-      `SELECT COUNT(*)::int AS c FROM debt_returns WHERE debt_id = $1`,
-      [debtId]
+      `SELECT COUNT(*)::int AS c
+       FROM debts
+       WHERE user_id = $1 AND person_id = $2 AND debt_type = 'returned_to_me'`,
+      [userId, personId]
     );
-    expect(remainingReturns.rows[0].c).toBe(0);
+    expect(remainingReturns.rows[0].c).toBeGreaterThanOrEqual(2);
 
     expect((await expectSummaryMatchesSource(userId, YEAR, 12)).given_total).toBe(
       0
     );
     expect(
       (await expectSummaryMatchesSource(userId, YEAR + 1, 1)).given_returned
-    ).toBe(0);
+    ).toBe(4000);
     expect(
       (await expectSummaryMatchesSource(userId, YEAR + 1, 2)).given_returned
-    ).toBe(0);
+    ).toBe(2000);
   });
 
   test("rebuild after mutation is idempotent", async () => {

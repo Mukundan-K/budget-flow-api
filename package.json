@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "jest",
+    "test": "jest --runInBand",
     "backfill:monthly-summary": "node scripts/backfill-monthly-financial-summary.js",
     "repair:monthly-summary": "node scripts/repair-monthly-financial-summary.js",
     "compare:monthly-summary": "node scripts/compare-monthly-financial-summary.js",

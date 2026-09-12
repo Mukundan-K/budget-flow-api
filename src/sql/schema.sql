@@ -188,16 +188,7 @@ CREATE TABLE IF NOT EXISTS debts (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
   amount NUMERIC(18, 8) NOT NULL CHECK (amount > 0),
-  debt_type VARCHAR(20) NOT NULL CHECK (debt_type IN ('given', 'received')),
+  debt_type VARCHAR(20) NOT NULL CHECK (debt_type IN ('given', 'received', 'returned_by_me', 'returned_to_me')),
   debt_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS debt_returns (
-  id SERIAL PRIMARY KEY,
-  debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  amount NUMERIC(18, 8) NOT NULL CHECK (amount > 0),
-  return_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   created_at TIMESTAMP DEFAULT NOW()
 );

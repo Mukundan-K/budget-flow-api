@@ -19,7 +19,6 @@ const {
 } = require("../utils/datetime");
 const {
   calculateDebtAmounts,
-  calculateDebtNet,
   calculateDebtSummary,
 } = require("../services/financial");
 const {
@@ -30,29 +29,30 @@ const {
   yearMonthFromTimestamp,
   rebuildAffectedMonthlyFinancialSummaries,
 } = require("../services/financial/monthlyFinancialSummary.service");
+const {
+  parseTransactionType,
+  listOutstandingByPerson,
+  getMonthlyDebtActivity,
+  listDebtTransactions,
+} = require("../services/financial/debtTransactions.service");
 
 /**
- * debt_type:
- * - given    = I lent / gave money to someone
- * - received = debt given to me (I borrowed / they lent me)
- * Returns: against given = they paid me back; against received = I repaid them
+ * Transaction types stored in `debts`:
+ * - received        = I received money (I owe them)
+ * - given           = I gave money (they owe me)
+ * - returned_by_me  = I returned money previously received
+ * - returned_to_me  = they returned money previously given
  */
 
+const DEBT_TYPE_ERROR =
+  "debt_type must be 'received', 'given', 'returned_by_me', or 'returned_to_me'";
+
 function parseDebtType(value) {
-  if (value === undefined || value === null || value === "") return undefined;
-  const normalized = String(value).trim().toLowerCase();
-  if (normalized === "given" || normalized === "give" || normalized === "lent") {
-    return "given";
-  }
-  if (
-    normalized === "received" ||
-    normalized === "receive" ||
-    normalized === "taken" ||
-    normalized === "borrowed"
-  ) {
-    return "received";
-  }
-  return null;
+  return parseTransactionType(value);
+}
+
+function requestedDebtType(body) {
+  return body.debt_type ?? body.transaction_type ?? body.type;
 }
 
 function mapDebt(row) {
@@ -77,35 +77,45 @@ function mapDebt(row) {
     is_pending_zero: amounts.is_pending_zero,
     has_pending: amounts.has_pending,
     debt_type: row.debt_type,
+    transaction_type: row.debt_type,
     date: formatTimestamp(row.debt_date),
     user_id: row.user_id,
     created_at: formatTimestamp(row.created_at) || row.created_at,
   };
 }
 
-function mapDebtReturn(row) {
-  return {
-    id: row.id,
-    debt_id: row.debt_id,
-    user_id: row.user_id,
-    amount: formatAmount(row.amount),
-    date: formatTimestamp(row.return_date),
-    created_at: formatTimestamp(row.created_at) || row.created_at,
-  };
+function parseMonthYearQuery(query) {
+  const { month, year } = query;
+  const hasMonth = month !== undefined && month !== null && month !== "";
+  const hasYear = year !== undefined && year !== null && year !== "";
+
+  if (!hasMonth && !hasYear) {
+    return { month: null, year: null };
+  }
+
+  const y = hasYear ? Number(year) : new Date().getFullYear();
+  if (!Number.isInteger(y) || y < 2000) {
+    return { error: "year must be a valid year" };
+  }
+
+  if (!hasMonth) {
+    return { month: null, year: y };
+  }
+
+  const m = Number(month);
+  if (!Number.isInteger(m) || m < 1 || m > 12) {
+    return { error: "month must be an integer between 1 and 12" };
+  }
+  return { month: m, year: y };
 }
 
 const DEBT_SELECT = `
   SELECT d.id, d.user_id, d.person_id, d.amount, d.debt_type,
          d.debt_date, d.created_at,
          p.name AS person_name,
-         COALESCE(ret.returned_amount, 0) AS returned_amount
+         0 AS returned_amount
   FROM debts d
   JOIN persons p ON p.id = d.person_id
-  LEFT JOIN (
-    SELECT debt_id, SUM(amount) AS returned_amount
-    FROM debt_returns
-    GROUP BY debt_id
-  ) ret ON ret.debt_id = d.id
 `;
 
 function debtOriginSummaryTarget(debt) {
@@ -115,23 +125,6 @@ function debtOriginSummaryTarget(debt) {
     year: ym.year,
     month: ym.month,
   };
-}
-
-function debtReturnSummaryTarget(ret) {
-  const ym = yearMonthFromTimestamp(ret.return_date);
-  return {
-    user_id: ret.user_id,
-    year: ym.year,
-    month: ym.month,
-  };
-}
-
-async function fetchDebtReturns(client, debtId) {
-  const result = await client.query(
-    `SELECT id, user_id, return_date FROM debt_returns WHERE debt_id = $1`,
-    [debtId]
-  );
-  return result.rows;
 }
 
 async function fetchMappedDebt(client, debtId) {
@@ -160,12 +153,19 @@ function validatePayload(body, { partial = false } = {}) {
     }
   }
 
-  if (!partial || body.debt_type !== undefined || body.type !== undefined) {
-    const type = parseDebtType(body.debt_type ?? body.type);
+  if (
+    !partial ||
+    body.debt_type !== undefined ||
+    body.transaction_type !== undefined ||
+    body.type !== undefined
+  ) {
+    const type = parseDebtType(requestedDebtType(body));
     if (type === undefined) {
-      errors.push("debt_type is required ('given' or 'received')");
+      errors.push(
+        "debt_type is required ('received', 'given', 'returned_by_me', or 'returned_to_me')"
+      );
     } else if (type === null) {
-      errors.push("debt_type must be 'given' or 'received'");
+      errors.push(DEBT_TYPE_ERROR);
     }
   }
 
@@ -197,6 +197,178 @@ async function assertPersonForUser(person_id, user_id) {
   }
   return { person: result.rows[0] };
 }
+
+// Current outstanding balances — all history, no month/year filter
+// GET /api/debts/outstanding?user_id=1
+router.get("/outstanding", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) {
+      return badRequest(res, "user_id is required");
+    }
+
+    const outstanding = await listOutstandingByPerson(user_id);
+    return success(
+      res,
+      outstanding,
+      "Outstanding debt by person fetched successfully"
+    );
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching outstanding debts");
+  }
+});
+
+// Monthly debt activity (transaction dates in the selected month)
+// GET /api/debts/summary?user_id=1&year=2026&month=9
+router.get("/summary", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) {
+      return badRequest(res, "user_id is required");
+    }
+
+    const now = new Date();
+    const parsed = parseMonthYearQuery({
+      month: req.query.month,
+      year: req.query.year ?? now.getFullYear(),
+    });
+    if (parsed.error) {
+      return badRequest(res, parsed.error);
+    }
+
+    const summary = await getMonthlyDebtActivity(
+      user_id,
+      parsed.year,
+      parsed.month
+    );
+    return success(res, summary, "Debt monthly summary fetched successfully");
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching debt summary");
+  }
+});
+
+// Unified transaction timeline (origins + returns, each on its own date)
+// GET /api/debts/transactions?user_id=1
+// GET /api/debts/transactions?user_id=1&person_id=2
+// GET /api/debts/transactions?user_id=1&year=2026&month=9
+router.get("/transactions", async (req, res) => {
+  try {
+    const { user_id, person_id } = req.query;
+    if (!user_id) {
+      return badRequest(res, "user_id is required");
+    }
+
+    const parsed = parseMonthYearQuery(req.query);
+    if (parsed.error) {
+      return badRequest(res, parsed.error);
+    }
+
+    const items = await listDebtTransactions({
+      userId: user_id,
+      personId: person_id,
+      month: parsed.month,
+      year: parsed.year,
+    });
+    return success(res, items, "Debt transactions fetched successfully");
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error fetching debt transactions");
+  }
+});
+
+// Create any of the four transaction types
+// POST /api/debts/transactions
+router.post("/transactions", async (req, res) => {
+  try {
+    const user_id = req.body.user_id;
+    const person_id = req.body.person_id;
+    const transactionType = parseTransactionType(
+      req.body.transaction_type ?? req.body.debt_type ?? req.body.type
+    );
+    const amount = parseAmount(req.body.amount);
+
+    if (!user_id) {
+      return badRequest(res, "user_id is required");
+    }
+    if (!person_id) {
+      return badRequest(res, "person_id is required");
+    }
+    if (transactionType === undefined) {
+      return badRequest(
+        res,
+        "transaction_type is required ('received', 'given', 'returned_by_me', or 'returned_to_me')"
+      );
+    }
+    if (transactionType === null) {
+      return badRequest(
+        res,
+        "transaction_type must be 'received', 'given', 'returned_by_me', or 'returned_to_me'"
+      );
+    }
+    if (amount === null || amount <= 0) {
+      return badRequest(res, "amount must be a positive number");
+    }
+    const dateRaw = req.body.transaction_date ?? req.body.date;
+    if (dateRaw !== undefined && dateRaw !== null && dateRaw !== "") {
+      if (parseTimestamp(dateRaw) === null) {
+        return badRequest(res, "date must be a valid date or timestamp");
+      }
+    }
+
+    const txnDate = parseTimestamp(dateRaw) || nowTimestamp();
+    const personCheck = await assertPersonForUser(person_id, user_id);
+    if (personCheck.error) {
+      return badRequest(res, personCheck.error);
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const inserted = await client.query(
+        `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, user_id, debt_date`,
+        [user_id, person_id, formatAmount(amount), transactionType, txnDate]
+      );
+      await rebuildAffectedMonthlyFinancialSummaries(
+        [debtOriginSummaryTarget(inserted.rows[0])],
+        client
+      );
+      const mapped = await fetchMappedDebt(client, inserted.rows[0].id);
+      await client.query("COMMIT");
+
+      const messages = {
+        received: "Received transaction created successfully",
+        given: "Given transaction created successfully",
+        returned_by_me: "Returned by me recorded successfully",
+        returned_to_me: "Returned to me recorded successfully",
+      };
+      return created(
+        res,
+        {
+          transaction_type: transactionType,
+          debt: mapped,
+        },
+        messages[transactionType]
+      );
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        /* ignore */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error(err);
+    return serverError(res, "Error creating debt transaction");
+  }
+});
 
 // Details / summary — before /:id
 // GET /api/debts/details?user_id=1
@@ -285,7 +457,17 @@ router.get("/details", async (req, res) => {
         year: filterYear,
         debt: debt_net,
         debt_net,
-        overview: toDebtOverview(summary),
+        overview: {
+          ...toDebtOverview(summary),
+          ...(filterMonth != null
+            ? {
+                received_this_month: summary.received_total,
+                given_this_month: summary.given_total,
+                returned_by_me_this_month: summary.received_returned,
+                returned_to_me_this_month: summary.given_returned,
+              }
+            : {}),
+        },
         given: {
           total: summary.given_total,
           returned: summary.given_returned,
@@ -316,70 +498,10 @@ router.get("/pending-by-person", async (req, res) => {
       return badRequest(res, "user_id is required");
     }
 
-    const debts = await db.query(
-      `${DEBT_SELECT}
-       WHERE d.user_id = $1
-       ORDER BY p.name ASC, d.id ASC`,
-      [user_id]
-    );
-
-    const byPerson = new Map();
-    debts.rows.map(mapDebt).forEach((debt) => {
-      const key = debt.person_id;
-      if (!byPerson.has(key)) {
-        byPerson.set(key, {
-          person_id: debt.person_id,
-          person_name: debt.person_name,
-          given_outstanding: 0,
-          received_outstanding: 0,
-        });
-      }
-      const row = byPerson.get(key);
-      if (debt.debt_type === "given") {
-        row.given_outstanding = addAmounts(row.given_outstanding, debt.outstanding);
-      } else {
-        row.received_outstanding = addAmounts(
-          row.received_outstanding,
-          debt.outstanding
-        );
-      }
-    });
-
-    const people = [...byPerson.values()]
-      .map((row) => {
-        const given_outstanding = formatAmount(row.given_outstanding);
-        const received_outstanding = formatAmount(row.received_outstanding);
-        return {
-          person_id: row.person_id,
-          person_name: row.person_name,
-          given_outstanding,
-          received_outstanding,
-          net: calculateDebtNet(given_outstanding, received_outstanding),
-          has_pending: given_outstanding > 0 || received_outstanding > 0,
-        };
-      })
-      .filter((row) => row.has_pending)
-      .sort(
-        (a, b) =>
-          Math.abs(b.net) - Math.abs(a.net) ||
-          String(a.person_name).localeCompare(String(b.person_name))
-      );
-
-    const given_outstanding = formatAmount(
-      addAmounts(...people.map((p) => p.given_outstanding))
-    );
-    const received_outstanding = formatAmount(
-      addAmounts(...people.map((p) => p.received_outstanding))
-    );
-
+    const outstanding = await listOutstandingByPerson(user_id);
     return success(
       res,
-      {
-        given_outstanding,
-        received_outstanding,
-        debt_net: calculateDebtNet(given_outstanding, received_outstanding),
-        people,
-      },
+      outstanding,
       "Pending debt by person fetched successfully"
     );
   } catch (err) {
@@ -398,7 +520,7 @@ router.post("/", async (req, res) => {
 
     const amount = formatAmount(req.body.amount);
     const person_id = req.body.person_id;
-    const debt_type = parseDebtType(req.body.debt_type ?? req.body.type);
+    const debt_type = parseDebtType(requestedDebtType(req.body));
     const user_id = req.body.user_id;
     const debt_date = parseTimestamp(req.body.date) || nowTimestamp();
 
@@ -455,7 +577,7 @@ router.get("/", async (req, res) => {
     const parsedType = parseDebtType(debt_type ?? type);
     if (debt_type !== undefined || type !== undefined) {
       if (!parsedType) {
-        return badRequest(res, "debt_type must be 'given' or 'received'");
+        return badRequest(res, DEBT_TYPE_ERROR);
       }
       params.push(parsedType);
       conditions.push(`d.debt_type = $${params.length}`);
@@ -510,160 +632,6 @@ router.get("/", async (req, res) => {
   }
 });
 
-// List returns for a debt
-router.get("/:id/returns", async (req, res) => {
-  try {
-    const debt = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      req.params.id,
-    ]);
-    if (debt.rows.length === 0) {
-      return notFound(res, "Debt not found");
-    }
-
-    const returns = await db.query(
-      `SELECT * FROM debt_returns
-       WHERE debt_id = $1
-       ORDER BY return_date DESC, id DESC`,
-      [req.params.id]
-    );
-
-    return success(
-      res,
-      {
-        debt: mapDebt(debt.rows[0]),
-        returns: returns.rows.map(mapDebtReturn),
-      },
-      "Debt returns fetched successfully"
-    );
-  } catch (err) {
-    console.error(err);
-    return serverError(res, "Error fetching debt returns");
-  }
-});
-
-// Add return (for given = they paid me back; for received = I repaid)
-router.post("/:id/returns", async (req, res) => {
-  try {
-    const debt = await db.query(`${DEBT_SELECT} WHERE d.id = $1`, [
-      req.params.id,
-    ]);
-    if (debt.rows.length === 0) {
-      return notFound(res, "Debt not found");
-    }
-
-    const amount = parseAmount(req.body.amount);
-    if (amount === null || amount <= 0) {
-      return badRequest(res, "amount must be a positive number");
-    }
-
-    const user_id = req.body.user_id ?? debt.rows[0].user_id;
-    if (String(user_id) !== String(debt.rows[0].user_id)) {
-      return badRequest(res, "user_id does not match debt owner");
-    }
-
-    if (req.body.date !== undefined && req.body.date !== null && req.body.date !== "") {
-      if (parseTimestamp(req.body.date) === null) {
-        return badRequest(res, "date must be a valid date or timestamp");
-      }
-    }
-    const return_date = parseTimestamp(req.body.date) || nowTimestamp();
-
-    const remaining = formatAmount(
-      formatAmount(debt.rows[0].amount) -
-        formatAmount(debt.rows[0].returned_amount || 0)
-    );
-    if (amount > remaining) {
-      return badRequest(
-        res,
-        `return amount exceeds remaining debt amount (available: ${remaining})`
-      );
-    }
-
-    const client = await db.connect();
-    try {
-      await client.query("BEGIN");
-      const inserted = await client.query(
-        `INSERT INTO debt_returns (debt_id, user_id, amount, return_date)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [req.params.id, user_id, amount, return_date]
-      );
-
-      await rebuildAffectedMonthlyFinancialSummaries(
-        [debtReturnSummaryTarget(inserted.rows[0])],
-        client
-      );
-
-      const mappedDebt = await fetchMappedDebt(client, req.params.id);
-      await client.query("COMMIT");
-      return created(
-        res,
-        {
-          return: mapDebtReturn(inserted.rows[0]),
-          debt: mappedDebt,
-        },
-        "Debt return added successfully"
-      );
-    } catch (err) {
-      try {
-        await client.query("ROLLBACK");
-      } catch (_) {
-        /* ignore */
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    console.error(err);
-    return serverError(res, "Error adding debt return");
-  }
-});
-
-// Delete return
-router.delete("/:id/returns/:returnId", async (req, res) => {
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-    const result = await client.query(
-      `DELETE FROM debt_returns
-       WHERE id = $1 AND debt_id = $2
-       RETURNING *`,
-      [req.params.returnId, req.params.id]
-    );
-    if (result.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return notFound(res, "Debt return not found");
-    }
-
-    await rebuildAffectedMonthlyFinancialSummaries(
-      [debtReturnSummaryTarget(result.rows[0])],
-      client
-    );
-
-    const mappedDebt = await fetchMappedDebt(client, req.params.id);
-    await client.query("COMMIT");
-    return success(
-      res,
-      {
-        return: mapDebtReturn(result.rows[0]),
-        debt: mappedDebt,
-      },
-      "Debt return deleted successfully"
-    );
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_) {
-      /* ignore */
-    }
-    console.error(err);
-    return serverError(res, "Error deleting debt return");
-  } finally {
-    client.release();
-  }
-});
-
 // Get one
 router.get("/:id", async (req, res) => {
   try {
@@ -674,18 +642,11 @@ router.get("/:id", async (req, res) => {
       return notFound(res, "Debt not found");
     }
 
-    const returns = await db.query(
-      `SELECT * FROM debt_returns
-       WHERE debt_id = $1
-       ORDER BY return_date DESC, id DESC`,
-      [req.params.id]
-    );
-
     return success(
       res,
       {
         ...mapDebt(result.rows[0]),
-        returns: returns.rows.map(mapDebtReturn),
+        returns: [],
       },
       "Debt fetched successfully"
     );
@@ -717,8 +678,10 @@ async function updateDebt(req, res, { partial = false } = {}) {
     const person_id =
       req.body.person_id !== undefined ? req.body.person_id : current.person_id;
     const debt_type =
-      req.body.debt_type !== undefined || req.body.type !== undefined
-        ? parseDebtType(req.body.debt_type ?? req.body.type)
+      req.body.debt_type !== undefined ||
+      req.body.transaction_type !== undefined ||
+      req.body.type !== undefined
+        ? parseDebtType(requestedDebtType(req.body))
         : current.debt_type;
     const user_id = req.body.user_id ?? current.user_id;
     const debt_date =
@@ -727,25 +690,12 @@ async function updateDebt(req, res, { partial = false } = {}) {
         : current.debt_date;
 
     if (debt_type === null) {
-      return badRequest(res, "debt_type must be 'given' or 'received'");
+      return badRequest(res, DEBT_TYPE_ERROR);
     }
 
     const personCheck = await assertPersonForUser(person_id, user_id);
     if (personCheck.error) {
       return badRequest(res, personCheck.error);
-    }
-
-    const returned = await db.query(
-      `SELECT COALESCE(SUM(amount), 0) AS returned_amount
-       FROM debt_returns WHERE debt_id = $1`,
-      [req.params.id]
-    );
-    const alreadyReturned = formatAmount(returned.rows[0].returned_amount);
-    if (amount < alreadyReturned) {
-      return badRequest(
-        res,
-        `amount cannot be less than already returned amount (${alreadyReturned})`
-      );
     }
 
     const client = await db.connect();
@@ -759,11 +709,6 @@ async function updateDebt(req, res, { partial = false } = {}) {
         await client.query("ROLLBACK");
         return notFound(res, "Debt not found");
       }
-
-      const returns =
-        locked.rows[0].debt_type !== debt_type
-          ? await fetchDebtReturns(client, req.params.id)
-          : [];
 
       await client.query(
         `UPDATE debts
@@ -779,7 +724,6 @@ async function updateDebt(req, res, { partial = false } = {}) {
       const targets = [
         debtOriginSummaryTarget(locked.rows[0]),
         debtOriginSummaryTarget({ user_id, debt_date }),
-        ...returns.map(debtReturnSummaryTarget),
       ];
       await rebuildAffectedMonthlyFinancialSummaries(targets, client);
 
@@ -818,14 +762,9 @@ router.delete("/:id", async (req, res) => {
       return notFound(res, "Debt not found");
     }
 
-    const returns = await fetchDebtReturns(client, req.params.id);
-
     await client.query(`DELETE FROM debts WHERE id = $1`, [req.params.id]);
     await rebuildAffectedMonthlyFinancialSummaries(
-      [
-        debtOriginSummaryTarget(existing.rows[0]),
-        ...returns.map(debtReturnSummaryTarget),
-      ],
+      [debtOriginSummaryTarget(existing.rows[0])],
       client
     );
     await client.query("COMMIT");

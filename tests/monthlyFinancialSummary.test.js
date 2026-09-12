@@ -197,17 +197,16 @@ describe("monthly_financial_summary rebuild", () => {
     expect(row.savings_debited).toBe(1000);
   });
 
-  test("given debt uses debt_date; return uses return_date", async () => {
-    const debt = await db.query(
+  test("given debt uses debt_date; returned_to_me uses its own debt_date", async () => {
+    await db.query(
       `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
-       VALUES ($1, $2, $3, 'given', $4)
-       RETURNING id`,
+       VALUES ($1, $2, $3, 'given', $4)`,
       [userId, personId, 10000, parseTimestamp("2026-01-10")]
     );
     await db.query(
-      `INSERT INTO debt_returns (debt_id, user_id, amount, return_date)
-       VALUES ($1, $2, $3, $4)`,
-      [debt.rows[0].id, userId, 4000, parseTimestamp("2026-03-05")]
+      `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
+       VALUES ($1, $2, $3, 'returned_to_me', $4)`,
+      [userId, personId, 4000, parseTimestamp("2026-03-05")]
     );
 
     const january = await rebuild(2026, 1);
@@ -218,17 +217,16 @@ describe("monthly_financial_summary rebuild", () => {
     expect(march.given_returned).toBe(4000);
   });
 
-  test("received debt uses debt_date; repayment uses return_date", async () => {
-    const debt = await db.query(
+  test("received debt uses debt_date; returned_by_me uses its own debt_date", async () => {
+    await db.query(
       `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
-       VALUES ($1, $2, $3, 'received', $4)
-       RETURNING id`,
+       VALUES ($1, $2, $3, 'received', $4)`,
       [userId, personId, 6000, parseTimestamp("2026-01-11")]
     );
     await db.query(
-      `INSERT INTO debt_returns (debt_id, user_id, amount, return_date)
-       VALUES ($1, $2, $3, $4)`,
-      [debt.rows[0].id, userId, 2000, parseTimestamp("2026-03-06")]
+      `INSERT INTO debts (user_id, person_id, amount, debt_type, debt_date)
+       VALUES ($1, $2, $3, 'returned_by_me', $4)`,
+      [userId, personId, 2000, parseTimestamp("2026-03-06")]
     );
 
     const january = await rebuild(2026, 1);
